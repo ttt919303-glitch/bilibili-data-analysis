@@ -1,0 +1,17 @@
+browser_data/
+browser_data_manual/
+debug/
+playwright/.auth/
+venv/
+.venv/
+instance/
+.idea/
+data/backups/
+data/*.log
+data/*.err.log
+data/interaction_backfill_state.json
+data/replacement_plan.json
+__pycache__/
+tests/__pycache__/
+*.pyc
+.pytest_cache/

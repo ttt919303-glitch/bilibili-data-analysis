@@ -1,0 +1,168 @@
+{% extends 'base.html' %}
+
+{% block title %}数据管理 - 哔哩哔哩视频数据分析系统{% endblock %}
+
+{% block content %}
+  <section class="mb-4">
+    <p class="eyebrow">数据管理</p>
+    <h1 class="h3 mb-2">B站数据采集与数据管理</h1>
+    <p class="text-secondary mb-0">浏览器采集或 API 采集会自动写入 data/videos.csv（已有数据会追加）；无需手动上传 CSV。</p>
+  </section>
+
+  <section class="card mb-4">
+    <div class="card-body">
+      <h2 class="h5 mb-3">B站数据采集</h2>
+      <div class="mb-3">
+        <div class="d-flex justify-content-between small mb-1">
+          <span>当前累计数据：{{ raw_total_count }} / 10000 条</span>
+          <span>{{ '%.1f'|format(crawl_progress) }}%</span>
+        </div>
+        <div class="progress" role="progressbar" aria-label="课程数据量进度" aria-valuenow="{{ crawl_progress }}" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar" style="width: {{ crawl_progress }}%"></div>
+        </div>
+        {% if raw_total_count >= 10000 %}
+          <p class="text-success small mt-2 mb-0">已达到课程要求的10000条数据。</p>
+        {% endif %}
+      </div>
+      <form method="post" action="{{ url_for('crawl_data') }}" class="row g-3 align-items-end">
+        <div class="col-md-6">
+          <label class="form-label" for="keyword">关键词</label>
+          <input class="form-control" id="keyword" name="keyword" type="text" placeholder="例如：大数据技术" required>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label" for="limit">采集数量</label>
+          <input class="form-control" id="limit" name="limit" type="number" min="1" value="100" required>
+        </div>
+        <div class="col-md-3">
+          <div class="d-grid gap-2">
+            <button class="btn btn-primary" type="submit" formaction="{{ url_for('browser_crawl_data') }}">浏览器采集（推荐）</button>
+            <button class="btn btn-outline-secondary" type="submit">API采集（备用）</button>
+          </div>
+        </div>
+      </form>
+      <p class="text-secondary small mt-3 mb-0">直接输入关键词和数量，点击上方采集按钮即可自动爬取并写入 CSV。</p>
+      <p class="text-secondary small mt-3 mb-0">浏览器采集通过项目独立 Edge 会话访问 B 站搜索页和视频详情页，自动同步播放、点赞、投币、收藏和分享；建议单次采集50~200条。</p>
+      <p class="text-secondary small mb-0">浏览器采集不读取系统默认浏览器账号数据，完成采集后请按流程手动执行清洗、HDFS和分析。</p>
+      {% if browser_crawl_result %}
+        <div class="alert alert-{{ 'success' if browser_crawl_result.status == '正常完成' else 'warning' }} mt-3 mb-0">
+          <strong>浏览器采集结果</strong><br>
+          关键词：{{ browser_crawl_result.keyword }}；计划新增：{{ browser_crawl_result.planned_count }}条；实际新增：{{ browser_crawl_result.saved_count }}条；详情互动采集：{{ browser_crawl_result.interaction_updated_count }}条；详情未完成：{{ browser_crawl_result.interaction_remaining_count }}条；解析视频：{{ browser_crawl_result.parsed_count }}条；跳过重复：{{ browser_crawl_result.skipped_count }}条；采集页数：{{ browser_crawl_result.page_count }}页；当前累计：{{ browser_crawl_result.total_count }}条<br>
+          状态：{{ browser_crawl_result.status }}
+        </div>
+      {% endif %}
+      <form method="post" action="{{ url_for('browser_backfill_data') }}" class="mt-3">
+        <button class="btn btn-outline-primary" type="submit">修复历史互动数据（50条）</button>
+      </form>
+      <p class="text-secondary small mb-0">仅用于修复旧数据；新的浏览器采集已经自动同步详情互动字段。完成后请按需手动执行数据清洗。</p>
+      {% if browser_backfill_result %}
+        <div class="alert alert-{{ 'success' if browser_backfill_result.status == '正常完成' else 'warning' }} mt-3 mb-0">
+          <strong>互动数据回填结果</strong><br>
+          计划回填：{{ browser_backfill_result.planned_count }}条；成功回填：{{ browser_backfill_result.updated_count }}条；已处理：{{ browser_backfill_result.processed_count }}条；跳过：{{ browser_backfill_result.skipped_count }}条；已记录失败：{{ browser_backfill_result.failed_count }}条；未完成链接：{{ browser_backfill_result.remaining_count }}条；当前原始数据：{{ browser_backfill_result.total_count }}条<br>
+          状态：{{ browser_backfill_result.status }}
+        </div>
+      {% endif %}
+      {% if crawl_result %}
+        <div class="alert alert-success mt-3 mb-0">
+          <strong>采集完成</strong><br>
+          关键词：{{ crawl_result.keyword }}；计划采集：{{ crawl_result.planned_count }}条；成功采集：{{ crawl_result.success_count }}条；请求页数：{{ crawl_result.page_count }}页；当前累计：{{ crawl_result.total_count }}条；采集时间：{{ crawl_result.crawl_time }}<br>
+          状态：{{ crawl_result.status }}{% if crawl_result.message %}；{{ crawl_result.message }}{% endif %}
+        </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card mb-4">
+    <div class="card-body">
+      <h2 class="h5 mb-2">可选：导入已有 CSV</h2>
+      <p class="text-secondary small">仅当你已有外部 CSV 文件时使用；正常 B 站采集无需上传。</p>
+      <form method="post" enctype="multipart/form-data" class="row g-3 align-items-end">
+        <div class="col-md-8">
+          <label class="form-label" for="file">选择 CSV 文件</label>
+          <input class="form-control" id="file" name="file" type="file" accept=".csv,text/csv" required>
+        </div>
+        <div class="col-md-4">
+          <button class="btn btn-primary w-100" type="submit">导入 CSV 数据</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="card mb-4">
+    <div class="card-body">
+      <h2 class="h5 mb-3">数据清洗</h2>
+      <div class="row g-3 mb-3">
+        <div class="col-sm-6 col-lg-3"><span class="summary-label">原始数据</span><strong>{{ cleaning_summary.raw_count }} 条</strong></div>
+        <div class="col-sm-6 col-lg-3"><span class="summary-label">清洗后数据</span><strong>{{ cleaning_summary.cleaned_count }} 条</strong></div>
+        <div class="col-sm-6 col-lg-3"><span class="summary-label">删除重复</span><strong>{{ cleaning_summary.duplicate_count }} 条</strong></div>
+        <div class="col-sm-6 col-lg-3"><span class="summary-label">处理缺失值</span><strong>{{ cleaning_summary.missing_count }} 个</strong></div>
+      </div>
+      <p class="text-secondary small">最后清洗时间：{{ cleaning_summary.last_cleaned_at }}</p>
+      <form method="post" action="{{ url_for('clean_data') }}">
+        <button class="btn btn-outline-primary" type="submit">开始数据清洗</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="card mb-4">
+    <div class="card-body">
+      <h2 class="h5 mb-3">HDFS 数据存储</h2>
+      <p class="mb-1">HDFS状态：{{ '可用' if hdfs_available else '未启动' }}</p>
+      <p class="mb-1">目标路径：/bilibili/videos_cleaned.csv</p>
+      <p class="mb-3">文件状态：{{ '已上传' if hdfs_file_exists else '未上传' }}</p>
+      {% if not hdfs_available %}
+        <p class="text-secondary small">{{ hdfs_message }}</p>
+      {% endif %}
+      <div class="d-flex flex-wrap gap-2">
+        <form method="post" action="{{ url_for('upload_hdfs_data') }}">
+          <button class="btn btn-outline-primary" type="submit">上传清洗数据到 HDFS</button>
+        </form>
+        <form method="post" action="{{ url_for('verify_hdfs_data') }}">
+          <button class="btn btn-outline-secondary" type="submit">验证 HDFS 数据</button>
+        </form>
+      </div>
+      {% if hdfs_preview is not none %}
+        <pre class="hdfs-preview mt-3 mb-0">{{ hdfs_preview }}</pre>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-body">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <h2 class="h5 mb-0">视频数据列表</h2>
+        <span class="badge text-bg-primary">当前数据总量：{{ total_count }} 条</span>
+      </div>
+      <p class="text-secondary small">当前数据来源：{{ data_source }}</p>
+      {% if recent_videos %}
+        <div class="table-responsive">
+          <table class="table table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th>序号</th><th>视频标题</th><th>UP主</th><th>播放量</th><th>点赞量</th>
+                <th>投币量</th><th>收藏量</th><th>分享量</th><th>发布时间</th><th>采集日期</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for video in recent_videos %}
+                <tr>
+                  <td>{{ total_count - loop.index0 }}</td>
+                  <td class="title-cell">{{ video.get('title', '') }}</td>
+                  <td>{{ video.get('up_name', '') }}</td>
+                  <td>{{ video.get('play_count', 0) }}</td>
+                  <td>{{ video.get('like_count', 0) }}</td>
+                  <td>{{ video.get('coin_count', 0) }}</td>
+                  <td>{{ video.get('favorite_count', 0) }}</td>
+                  <td>{{ video.get('share_count', 0) }}</td>
+                  <td>{{ video.get('publish_time', '') }}</td>
+                  <td>{{ video.get('crawl_date', '') }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="text-secondary mb-0">暂无视频数据，请先使用上方 B 站采集。</p>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

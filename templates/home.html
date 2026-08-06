@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+
+{% block content %}
+  <section class="mb-4">
+    <p class="eyebrow">首页</p>
+    <h1 class="h3 mb-2">欢迎使用视频数据分析系统</h1>
+    <p class="text-secondary mb-0">数据统计实时读取 data/videos.csv，导入 CSV 后会自动更新。</p>
+  </section>
+  <section class="row g-3">
+    <div class="col-sm-6 col-xl-3">
+      <article class="card stat-card h-100"><div class="card-body"><p>视频总数</p><strong id="video-total">{{ '{:,}'.format(statistics.video_total) }}</strong><span>当前数据集记录数</span></div></article>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+      <article class="card stat-card h-100"><div class="card-body"><p>UP 主数量</p><strong id="up-total">{{ '{:,}'.format(statistics.up_total) }}</strong><span>当前数据集 UP 主数</span></div></article>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+      <article class="card stat-card h-100"><div class="card-body"><p>累计播放量</p><strong id="play-total">{{ '{:,}'.format(statistics.play_total) }}</strong><span>当前数据集播放量总和</span></div></article>
+    </div>
+    <div class="col-sm-6 col-xl-3">
+      <article class="card stat-card h-100"><div class="card-body"><p>累计点赞量</p><strong id="like-total">{{ '{:,}'.format(statistics.like_total) }}</strong><span>当前数据集点赞量总和</span></div></article>
+    </div>
+  </section>
+{% endblock %}

@@ -79,4 +79,3 @@ python app.py
 ```powershell
 ..\.venv\Scripts\python.exe debug_browser_interactions.py --browser msedge
 ```
-
