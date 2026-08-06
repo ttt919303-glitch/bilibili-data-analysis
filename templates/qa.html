@@ -1,1 +1,14 @@
-{% extends 'base.html' %}{% block content %}<h1 class="h3">AI 视频知识库问答</h1><p>基于当前本地视频数据进行问答，所有结果来自已采集和清洗的数据。当前数据量：{{data_count}}条；来源：{{source}}</p><form method="post"><textarea class="form-control mb-2" name="question" placeholder="请输入问题" required></textarea><button class="btn btn-primary">开始问答</button></form>{% if answer %}<div class="card mt-3"><div class="card-body" style="white-space:pre-line">{{answer}}</div></div>{% endif %}<p class="mt-3">示例：哪个UP主视频最多？ / 播放量最高的10个视频有哪些？</p>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+  <h1 class="h3">AI 视频知识库问答</h1>
+  {% include '_date_filter.html' %}
+  <p>当前选择日期：{{ selected_date }}；当前数据来源：{{ source }}；知识库文档数量：{{ document_count }}；当前数据量：{{ data_count }} 条。</p>
+  {% if no_data %}<div class="alert alert-info">该日期暂无数据</div>{% endif %}
+  <form method="post">
+    <input type="hidden" name="date" value="{{ selected_date }}">
+    <textarea class="form-control mb-2" name="question" placeholder="请输入问题" required></textarea>
+    <button class="btn btn-primary">开始问答</button>
+  </form>
+  {% if answer %}<div class="card mt-3"><div class="card-body" style="white-space:pre-line">{{ answer }}</div></div>{% endif %}
+  <p class="mt-3">示例：当前有多少视频？ / 推荐几条适合学习Spark的视频。</p>
+{% endblock %}

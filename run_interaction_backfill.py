@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from collections.abc import Iterable
+from pathlib import Path
 
 from browser_interaction_backfill import (
     BACKFILL_LIMIT,
@@ -23,6 +24,8 @@ def print_report(result: dict[str, object]) -> None:
 def _run_batches(
     target_urls: Iterable[str] | None,
     report: Callable[[dict[str, object]], None] = print_report,
+    data_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, object]:
     requested_urls = list(target_urls) if target_urls is not None else None
     batch_count = 0
@@ -31,13 +34,14 @@ def _run_batches(
     skipped_count = 0
 
     while True:
-        if requested_urls is None:
-            result = backfill_bilibili_interactions(limit=BACKFILL_LIMIT)
-        else:
-            result = backfill_bilibili_interactions(
-                limit=BACKFILL_LIMIT,
-                target_urls=requested_urls,
-            )
+        call_arguments = {"limit": BACKFILL_LIMIT}
+        if requested_urls is not None:
+            call_arguments["target_urls"] = requested_urls
+        if data_path is not None:
+            call_arguments["data_path"] = data_path
+        if state_path is not None:
+            call_arguments["state_path"] = state_path
+        result = backfill_bilibili_interactions(**call_arguments)
         batch_count += 1
         updated_count += int(result["updated_count"])
         processed_count += int(result["processed_count"])
@@ -72,15 +76,21 @@ def _run_batches(
 
 def run_all_batches(
     report: Callable[[dict[str, object]], None] = print_report,
+    *,
+    data_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, object]:
-    return _run_batches(None, report)
+    return _run_batches(None, report, data_path, state_path)
 
 
 def run_target_batches(
     target_urls: Iterable[str],
     report: Callable[[dict[str, object]], None] = print_report,
+    *,
+    data_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, object]:
-    return _run_batches(target_urls, report)
+    return _run_batches(target_urls, report, data_path, state_path)
 
 
 def main() -> None:

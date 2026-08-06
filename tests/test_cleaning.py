@@ -115,11 +115,11 @@ def test_admin_cleaning_generates_cleaned_csv_and_keeps_raw_file(tmp_path):
 
 def test_home_prefers_cleaned_data_when_it_exists(tmp_path):
     client, raw_path, cleaned_path = create_client(tmp_path)
-    write_raw_csv(raw_path, [{"title": "原始视频", "up_name": "原始UP", "play_count": 999, "like_count": 999}])
-    write_raw_csv(cleaned_path, [{"title": "清洗视频", "up_name": "清洗UP", "play_count": 12000, "like_count": 300}])
+    write_raw_csv(raw_path, [{"title": "原始视频", "up_name": "原始UP", "play_count": 999, "like_count": 999, "publish_time": "2026-08-06"}])
+    write_raw_csv(cleaned_path, [{"title": "清洗视频", "up_name": "清洗UP", "play_count": 12000, "like_count": 300, "publish_time": "2026-08-06"}])
     login_as_admin(client)
 
-    response = client.get("/")
+    response = client.get("/?date=2026-08-06")
 
     page = response.get_data(as_text=True)
     assert 'id="play-total">12,000' in page
@@ -128,11 +128,11 @@ def test_home_prefers_cleaned_data_when_it_exists(tmp_path):
 
 def test_data_page_shows_cleaned_data_as_current_source(tmp_path):
     client, raw_path, cleaned_path = create_client(tmp_path)
-    write_raw_csv(raw_path, [{"title": "原始视频", "up_name": "原始UP", "play_count": 999, "like_count": 999}])
-    write_raw_csv(cleaned_path, [{"title": "清洗视频", "up_name": "清洗UP", "play_count": 100, "like_count": 10}])
+    write_raw_csv(raw_path, [{"title": "原始视频", "up_name": "原始UP", "play_count": 999, "like_count": 999, "publish_time": "2026-08-06"}])
+    write_raw_csv(cleaned_path, [{"title": "清洗视频", "up_name": "清洗UP", "play_count": 100, "like_count": 10, "publish_time": "2026-08-06"}])
     login_as_admin(client)
 
-    response = client.get("/data")
+    response = client.get("/data?date=2026-08-06")
 
     page = response.get_data(as_text=True)
     assert "当前数据来源：清洗数据" in page

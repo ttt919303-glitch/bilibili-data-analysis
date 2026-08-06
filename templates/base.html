@@ -10,15 +10,15 @@
 <body>
   <div class="app-layout">
     <aside class="sidebar">
-      <a class="brand" href="{{ url_for('home') }}">视频数据分析</a>
+      <a class="brand" href="{{ url_for('home', date=request.values.get('date') or session.get('selected_date')) }}">视频数据分析</a>
       <nav class="nav flex-column gap-1">
-        <a class="nav-link active" href="{{ url_for('home') }}">首页</a>
+        <a class="nav-link active" href="{{ url_for('home', date=request.values.get('date') or session.get('selected_date')) }}">首页</a>
         {% if g.user['role'] == 'admin' %}
-          <a class="nav-link" href="{{ url_for('data_management') }}">数据管理</a>
+          <a class="nav-link" href="{{ url_for('data_management', date=request.values.get('date') or session.get('selected_date')) }}">数据管理</a>
         {% endif %}
-        <a class="nav-link" href="{{ url_for('mining_page') }}">数据挖掘</a>
-        <a class="nav-link" href="{{ url_for('spark_page') }}">Spark 分析</a>
-        <a class="nav-link" href="{{ url_for('qa_page') }}">AI 知识库</a>
+        <a class="nav-link" href="{{ url_for('mining_page', date=request.values.get('date') or session.get('selected_date')) }}">数据挖掘</a>
+        <a class="nav-link" href="{{ url_for('spark_page', date=request.values.get('date') or session.get('selected_date')) }}">Spark 分析</a>
+        <a class="nav-link" href="{{ url_for('qa_page', date=request.values.get('date') or session.get('selected_date')) }}">AI 知识库</a>
       </nav>
     </aside>
     <div class="main-content">

@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from data_utils import load_cleaned_data, load_video_data, parse_number
+from data_utils import parse_number
+from hdfs_utils import load_analysis_dataframe
 
 
 FIELDS = {
@@ -20,16 +21,22 @@ def format_number(value):
     return f"{int(value):,}"
 
 
-def load_qa_data(cleaned_path: Path, raw_path: Path):
-    data = load_cleaned_data(cleaned_path) if cleaned_path.exists() else load_video_data(raw_path)
+def load_qa_data(
+    cleaned_path: Path,
+    raw_path: Path,
+    hdfs_cmd: str = "hdfs",
+    hdfs_url: str = "",
+    hdfs_user: str = "tan",
+):
+    data, source = load_analysis_dataframe(cleaned_path, raw_path, hdfs_cmd, hdfs_url, hdfs_user)
     for field in FIELDS.values():
         if field not in data:
             data[field] = 0
         data[field] = data[field].map(parse_number)
-    return data, "清洗数据" if cleaned_path.exists() else "原始数据"
+    return data, source
 
 
-def answer_question(question: str, data):
+def answer_question(question: str, data, retriever=None):
     question = question.strip()
     if not question:
         return "请输入问题。"
@@ -75,5 +82,17 @@ def answer_question(question: str, data):
         row = data.loc[data[field].idxmax()]
         label = next(key for key, value in FIELDS.items() if value == field)
         return f"当前{label}量最高的视频是《{row['title']}》，UP主为{row['up_name']}，数值为{format_number(row[field])}。"
+
+    if retriever is not None:
+        hits = retriever.invoke(question)
+        if not hits:
+            return "该日期知识库未检索到相关视频。"
+        lines = ["本地 LangChain Retriever 检索命中："]
+        for index, document in enumerate(hits, start=1):
+            title = document.metadata.get("title", "未知标题")
+            up_name = document.metadata.get("up_name", "")
+            video_url = document.metadata.get("video_url", "")
+            lines.append(f"{index}.《{title}》 {up_name} {video_url}".strip())
+        return "\n".join(lines)
 
     return "当前知识库主要支持B站视频数据查询，例如：哪个UP主视频最多？播放量最高的视频是哪个？"

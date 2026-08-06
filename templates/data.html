@@ -8,6 +8,16 @@
     <h1 class="h3 mb-2">B站数据采集与数据管理</h1>
     <p class="text-secondary mb-0">浏览器采集或 API 采集会自动写入 data/videos.csv（已有数据会追加）；无需手动上传 CSV。</p>
   </section>
+  {% include '_date_filter.html' %}
+  {% if no_data %}<div class="alert alert-info">该日期暂无数据</div>{% endif %}
+
+  <section class="card mb-4"><div class="card-body">
+    <h2 class="h5">每日自动任务</h2>
+    {% if daily_pipeline_status %}
+      <p class="small mb-2">最近执行：{{ daily_pipeline_status.executed_at }}；目标日期：{{ daily_pipeline_status.target_date }}；采集 {{ daily_pipeline_status.collected_count }} 条；日期筛选后 {{ daily_pipeline_status.date_filtered_count }} 条；新增 {{ daily_pipeline_status.added_count }} 条；HDFS：{{ daily_pipeline_status.hdfs_upload_status }}{% if daily_pipeline_status.error_summary %}；错误：{{ daily_pipeline_status.error_summary }}{% endif %}</p>
+    {% else %}<p class="text-secondary small">尚无自动任务执行记录。</p>{% endif %}
+    <form method="post" action="{{ url_for('run_daily_pipeline_now') }}"><input type="hidden" name="date" value="{{ selected_date }}"><button class="btn btn-outline-primary" type="submit">立即执行昨日任务</button></form>
+  </div></section>
 
   <section class="card mb-4">
     <div class="card-body">
@@ -25,6 +35,7 @@
         {% endif %}
       </div>
       <form method="post" action="{{ url_for('crawl_data') }}" class="row g-3 align-items-end">
+        <input type="hidden" name="date" value="{{ selected_date }}">
         <div class="col-md-6">
           <label class="form-label" for="keyword">关键词</label>
           <input class="form-control" id="keyword" name="keyword" type="text" placeholder="例如：大数据技术" required>
@@ -42,7 +53,7 @@
       </form>
       <p class="text-secondary small mt-3 mb-0">直接输入关键词和数量，点击上方采集按钮即可自动爬取并写入 CSV。</p>
       <p class="text-secondary small mt-3 mb-0">浏览器采集通过项目独立 Edge 会话访问 B 站搜索页和视频详情页，自动同步播放、点赞、投币、收藏和分享；建议单次采集50~200条。</p>
-      <p class="text-secondary small mb-0">浏览器采集不读取系统默认浏览器账号数据，完成采集后请按流程手动执行清洗、HDFS和分析。</p>
+      <p class="text-secondary small mb-0">浏览器采集不读取系统默认浏览器账号数据；采集成功后会自动清洗并尝试上传 HDFS。</p>
       {% if browser_crawl_result %}
         <div class="alert alert-{{ 'success' if browser_crawl_result.status == '正常完成' else 'warning' }} mt-3 mb-0">
           <strong>浏览器采集结果</strong><br>
@@ -51,6 +62,7 @@
         </div>
       {% endif %}
       <form method="post" action="{{ url_for('browser_backfill_data') }}" class="mt-3">
+        <input type="hidden" name="date" value="{{ selected_date }}">
         <button class="btn btn-outline-primary" type="submit">修复历史互动数据（50条）</button>
       </form>
       <p class="text-secondary small mb-0">仅用于修复旧数据；新的浏览器采集已经自动同步详情互动字段。完成后请按需手动执行数据清洗。</p>
@@ -76,6 +88,7 @@
       <h2 class="h5 mb-2">可选：导入已有 CSV</h2>
       <p class="text-secondary small">仅当你已有外部 CSV 文件时使用；正常 B 站采集无需上传。</p>
       <form method="post" enctype="multipart/form-data" class="row g-3 align-items-end">
+        <input type="hidden" name="date" value="{{ selected_date }}">
         <div class="col-md-8">
           <label class="form-label" for="file">选择 CSV 文件</label>
           <input class="form-control" id="file" name="file" type="file" accept=".csv,text/csv" required>
@@ -98,6 +111,7 @@
       </div>
       <p class="text-secondary small">最后清洗时间：{{ cleaning_summary.last_cleaned_at }}</p>
       <form method="post" action="{{ url_for('clean_data') }}">
+        <input type="hidden" name="date" value="{{ selected_date }}">
         <button class="btn btn-outline-primary" type="submit">开始数据清洗</button>
       </form>
     </div>
@@ -114,9 +128,11 @@
       {% endif %}
       <div class="d-flex flex-wrap gap-2">
         <form method="post" action="{{ url_for('upload_hdfs_data') }}">
+          <input type="hidden" name="date" value="{{ selected_date }}">
           <button class="btn btn-outline-primary" type="submit">上传清洗数据到 HDFS</button>
         </form>
         <form method="post" action="{{ url_for('verify_hdfs_data') }}">
+          <input type="hidden" name="date" value="{{ selected_date }}">
           <button class="btn btn-outline-secondary" type="submit">验证 HDFS 数据</button>
         </form>
       </div>

@@ -117,15 +117,18 @@ def test_run_all_batches_stops_on_real_verification_fuse(monkeypatch):
     assert result["remaining_count"] == 100
 
 
-def test_run_target_batches_forwards_only_requested_urls(monkeypatch):
+def test_run_target_batches_forwards_requested_urls_and_runtime_paths(monkeypatch, tmp_path):
     target_urls = [
         "https://www.bilibili.com/video/BV1newA",
         "https://www.bilibili.com/video/BV1newB",
     ]
     calls = []
 
-    def backfill(limit: int, target_urls=None):
-        calls.append((limit, list(target_urls or [])))
+    data_path = tmp_path / "videos.csv"
+    state_path = tmp_path / "backfill-state.json"
+
+    def backfill(limit: int, target_urls=None, data_path=None, state_path=None):
+        calls.append((limit, list(target_urls or []), data_path, state_path))
         return batch_result(
             updated_count=2,
             processed_count=2,
@@ -137,8 +140,13 @@ def test_run_target_batches_forwards_only_requested_urls(monkeypatch):
 
     monkeypatch.setattr(runner, "backfill_bilibili_interactions", backfill)
 
-    result = runner.run_target_batches(target_urls, report=lambda _result: None)
+    result = runner.run_target_batches(
+        target_urls,
+        report=lambda _result: None,
+        data_path=data_path,
+        state_path=state_path,
+    )
 
-    assert calls == [(50, target_urls)]
+    assert calls == [(50, target_urls, data_path, state_path)]
     assert result["status"] == "success"
     assert result["updated_count"] == 2

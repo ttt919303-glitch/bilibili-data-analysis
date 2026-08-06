@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from hdfs_utils import HDFS_DATA_PATH, check_hdfs_available
+from date_utils import filter_by_publish_date
+from hdfs_utils import HDFS_DATA_PATH, check_hdfs_available, load_analysis_dataframe
 
 LOGGER = logging.getLogger(__name__)
 HDFS_SPARK_PATH = f"hdfs://{HDFS_DATA_PATH}"
@@ -170,8 +171,36 @@ def empty_analysis(source: str = "无可用数据") -> dict:
     }
 
 
-def run_spark_analysis(cleaned_path: Path, raw_path: Path, hdfs_cmd: str) -> dict:
+def run_spark_analysis(
+    cleaned_path: Path,
+    raw_path: Path,
+    hdfs_cmd: str,
+    selected_date: str | None = None,
+    hdfs_url: str = "",
+    hdfs_user: str = "tan",
+) -> dict:
     """完成四项 Spark Local Mode 分析，并转换为模板可直接使用的字典。"""
+    if selected_date is not None:
+        pandas_data, source = load_analysis_dataframe(
+            cleaned_path, raw_path, hdfs_cmd, hdfs_url, hdfs_user
+        )
+        pandas_data = filter_by_publish_date(pandas_data, selected_date)
+        if pandas_data.empty:
+            return empty_analysis(source)
+        spark = create_spark_session()
+        try:
+            data = _prepare_spark_data(spark.createDataFrame(pandas_data.astype(str)))
+            return {
+                "source": source,
+                "total_count": data.count(),
+                "up_video_count": analyze_up_video_count(data),
+                "top_played": analyze_top_played_videos(data),
+                "up_avg_play": analyze_up_average_play(data),
+                "publish_trend": analyze_publish_trend(data),
+            }
+        finally:
+            spark.stop()
+
     source, path = select_data_source(cleaned_path, raw_path, hdfs_cmd)
     if path is None:
         return empty_analysis(source)

@@ -88,7 +88,7 @@ def test_admin_can_start_browser_crawl(tmp_path):
         )
 
     assert response.status_code == 200
-    crawl.assert_called_once_with("Python", 20)
+    crawl.assert_called_once_with("Python", 20, data_path=tmp_path / "videos.csv")
 
 
 def test_browser_crawl_rejects_blank_keyword(tmp_path):

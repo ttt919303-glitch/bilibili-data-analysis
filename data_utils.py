@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 
@@ -115,7 +116,22 @@ def load_video_data(path: Path) -> pd.DataFrame:
 def save_video_data(data: pd.DataFrame, path: Path) -> None:
     """将标准字段顺序的视频数据写入固定 CSV 文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data.reindex(columns=VIDEO_COLUMNS).to_csv(path, index=False, encoding="utf-8-sig")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            data.reindex(columns=VIDEO_COLUMNS).to_csv(temporary_file, index=False)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def append_video_data(new_data: pd.DataFrame, path: Path) -> int:

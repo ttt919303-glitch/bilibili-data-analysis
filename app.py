@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 import os
-import threading
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -17,23 +16,27 @@ from data_utils import (
     append_video_data,
     clean_video_data,
     get_cleaning_summary,
-    load_cleaned_data,
     load_video_data,
     normalize_columns,
     parse_number,
 )
 from hdfs_utils import check_hdfs_available, check_hdfs_file, read_hdfs_preview, upload_cleaned_to_hdfs
+from hdfs_utils import load_analysis_dataframe
 from crawler import CrawlerError, crawl_bilibili
 from browser_crawler import crawl_bilibili_browser
 from browser_interaction_backfill import backfill_bilibili_interactions, get_supported_video_urls
 from run_interaction_backfill import run_target_batches
 from spark_analysis import SparkUnavailableError, run_spark_analysis
-from mining import load_mining_data, run_association_rules, run_kmeans, train_hot_model, predict_hot_video, MODEL_FEATURES
+from mining import load_mining_data, run_association_rules, run_kmeans, run_required_association_rules, train_hot_model, predict_hot_video, MODEL_FEATURES
 from qa import answer_question, load_qa_data
+from daily_pipeline import DATA_PIPELINE_LOCK, load_daily_pipeline_status, run_daily_pipeline
+from date_utils import InvalidBusinessDateError, filter_by_publish_date, resolve_business_date
+from knowledge_base import KnowledgeBaseService
+from scheduler import start_scheduler
 
 PROJECT_DIR = Path(__file__).resolve().parent
 BROWSER_CRAWL_LIMIT = 200
-browser_crawl_lock = threading.Lock()
+browser_crawl_lock = DATA_PIPELINE_LOCK
 
 
 def get_db() -> sqlite3.Connection:
@@ -112,14 +115,34 @@ def create_app(test_config: dict | None = None) -> Flask:
         HDFS_WEB_URL=default_hdfs_web_url,
         HDFS_WEB_USER=os.getenv("HDFS_WEB_USER", "tan"),
         HDFS_DATA_PATH="/bilibili/videos_cleaned.csv",
+        APP_TIMEZONE=os.getenv("APP_TIMEZONE", "Asia/Shanghai"),
+        AUTO_CRAWL_ENABLED=os.getenv("AUTO_CRAWL_ENABLED", "true"),
+        AUTO_CRAWL_KEYWORDS=os.getenv("AUTO_CRAWL_KEYWORDS", "大数据,人工智能,Python"),
+        AUTO_CRAWL_LIMIT=int(os.getenv("AUTO_CRAWL_LIMIT", "100")),
+        DAILY_PIPELINE_STATUS_PATH=PROJECT_DIR / "data" / "daily_pipeline_status.json",
+        KNOWLEDGE_BASE_PATH=PROJECT_DIR / "data" / "knowledge_base",
+        INTERACTION_BACKFILL_STATE_PATH=PROJECT_DIR / "data" / "interaction_backfill_state.json",
         PORT=5052,
     )
     if test_config is not None:
         app.config.update(test_config)
-        if "VIDEO_DATA_PATH" in test_config and "CLEANED_DATA_PATH" not in test_config:
-            test_data_path = Path(app.config["VIDEO_DATA_PATH"])
-            app.config["CLEANED_DATA_PATH"] = test_data_path.with_name("videos_cleaned.csv")
-            app.config["CLEANING_SUMMARY_PATH"] = test_data_path.with_name("cleaning_summary.json")
+        runtime_root = None
+        if "VIDEO_DATA_PATH" in test_config:
+            runtime_root = Path(app.config["VIDEO_DATA_PATH"]).parent
+        elif app.config["TESTING"]:
+            runtime_root = Path(app.config["DATABASE"]).parent
+        if runtime_root is not None:
+            runtime_defaults = {
+                "VIDEO_DATA_PATH": runtime_root / "videos.csv",
+                "CLEANED_DATA_PATH": runtime_root / "videos_cleaned.csv",
+                "CLEANING_SUMMARY_PATH": runtime_root / "cleaning_summary.json",
+                "DAILY_PIPELINE_STATUS_PATH": runtime_root / "daily_pipeline_status.json",
+                "KNOWLEDGE_BASE_PATH": runtime_root / "knowledge_base",
+                "INTERACTION_BACKFILL_STATE_PATH": runtime_root / "interaction_backfill_state.json",
+            }
+            for name, path in runtime_defaults.items():
+                if name not in test_config:
+                    app.config[name] = path
 
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +156,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "SELECT id, username, role FROM users WHERE id = ?", (user_id,)
             ).fetchone()
 
+        requested_date = request.values.get("date")
+        if requested_date:
+            session["selected_date"] = resolve_business_date(requested_date, app.config["APP_TIMEZONE"])
+
     @app.teardown_appcontext
     def close_db(_error: BaseException | None) -> None:
         db = g.pop("db", None)
@@ -142,6 +169,53 @@ def create_app(test_config: dict | None = None) -> Flask:
     with app.app_context():
         g.app = app
         initialize_users()
+
+    def selected_business_date() -> str:
+        selected_date = resolve_business_date(
+            request.values.get("date") or session.get("selected_date"),
+            app.config["APP_TIMEZONE"],
+        )
+        g.selected_date = selected_date
+        return selected_date
+
+    def load_selected_data(selected_date: str) -> tuple[pd.DataFrame, str]:
+        data, source = load_analysis_dataframe(
+            Path(app.config["CLEANED_DATA_PATH"]),
+            Path(app.config["VIDEO_DATA_PATH"]),
+            app.config["HDFS_CMD"],
+            app.config["HDFS_WEB_URL"],
+            app.config["HDFS_WEB_USER"],
+        )
+        filtered = filter_by_publish_date(data, selected_date)
+        return filtered, source
+
+    def display_data_source(source: str) -> str:
+        if source.startswith("本地清洗CSV"):
+            return source.replace("本地清洗CSV", "清洗数据", 1)
+        if source.startswith("本地原始CSV"):
+            return source.replace("本地原始CSV", "原始数据", 1)
+        return source
+
+    def run_post_collection_pipeline() -> dict | None:
+        raw_path = Path(app.config["VIDEO_DATA_PATH"])
+        if load_video_data(raw_path).empty:
+            return None
+        summary = clean_video_data(
+            raw_path,
+            Path(app.config["CLEANED_DATA_PATH"]),
+            Path(app.config["CLEANING_SUMMARY_PATH"]),
+        )
+        success, message = upload_cleaned_to_hdfs(
+            Path(app.config["CLEANED_DATA_PATH"]),
+            app.config["HDFS_CMD"],
+            app.config["HDFS_WEB_URL"],
+            app.config["HDFS_WEB_USER"],
+        )
+        if success:
+            app.logger.info("采集后流水线 HDFS 上传成功：%s", message)
+        else:
+            app.logger.warning("采集后流水线 HDFS 上传失败，本地数据已保留：%s", message)
+        return {"cleaning": summary, "hdfs_success": success, "hdfs_message": message}
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -172,9 +246,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/")
     @login_required
     def home():
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        cleaned_path = Path(app.config["CLEANED_DATA_PATH"])
-        video_data = load_cleaned_data(cleaned_path) if cleaned_path.exists() else load_video_data(raw_path)
+        selected_date = selected_business_date()
+        video_data, source = load_selected_data(selected_date)
         play_count = video_data["play_count"].map(parse_number).sum() if "play_count" in video_data else 0
         like_count = video_data["like_count"].map(parse_number).sum() if "like_count" in video_data else 0
         up_count = video_data["up_name"].nunique() if "up_name" in video_data else 0
@@ -184,20 +257,57 @@ def create_app(test_config: dict | None = None) -> Flask:
             "play_total": int(play_count),
             "like_total": int(like_count),
         }
-        return render_template("home.html", statistics=statistics)
+        return render_template(
+            "home.html",
+            statistics=statistics,
+            selected_date=selected_date,
+            data_source=display_data_source(source),
+            no_data=video_data.empty,
+        )
 
     @app.route("/qa", methods=["GET", "POST"])
     @login_required
     def qa_page():
-        data, source = load_qa_data(Path(app.config["CLEANED_DATA_PATH"]), Path(app.config["VIDEO_DATA_PATH"]))
-        answer = answer_question(request.form.get("question", ""), data) if request.method == "POST" else None
-        return render_template("qa.html", data_count=len(data), source=source, answer=answer)
+        selected_date = selected_business_date()
+        data, source = load_qa_data(
+            Path(app.config["CLEANED_DATA_PATH"]),
+            Path(app.config["VIDEO_DATA_PATH"]),
+            app.config["HDFS_CMD"],
+            app.config["HDFS_WEB_URL"],
+            app.config["HDFS_WEB_USER"],
+        )
+        data = filter_by_publish_date(data, selected_date)
+        knowledge = KnowledgeBaseService(Path(app.config["KNOWLEDGE_BASE_PATH"])).prepare(
+            data, selected_date, source
+        )
+        answer = (
+            answer_question(request.form.get("question", ""), data, retriever=knowledge.retriever)
+            if request.method == "POST"
+            else None
+        )
+        return render_template(
+            "qa.html",
+            data_count=len(data),
+            document_count=knowledge.document_count,
+            source=display_data_source(source),
+            answer=answer,
+            selected_date=selected_date,
+            no_data=data.empty,
+        )
 
     @app.route("/mining", methods=["GET", "POST"])
     @login_required
     def mining_page():
-        data, source = load_mining_data(Path(app.config["CLEANED_DATA_PATH"]), Path(app.config["VIDEO_DATA_PATH"]))
-        context = {"data_count": len(data), "source": source, "clusters": [], "points": [], "metrics": None, "rules": [], "prediction": None}
+        selected_date = selected_business_date()
+        data, source = load_mining_data(
+            Path(app.config["CLEANED_DATA_PATH"]),
+            Path(app.config["VIDEO_DATA_PATH"]),
+            app.config["HDFS_CMD"],
+            app.config["HDFS_WEB_URL"],
+            app.config["HDFS_WEB_USER"],
+        )
+        data = filter_by_publish_date(data, selected_date)
+        context = {"data_count": len(data), "source": display_data_source(source), "clusters": [], "points": [], "metrics": None, "rules": [], "required_rules": run_required_association_rules(data), "prediction": None, "selected_date": selected_date, "no_data": data.empty}
         if len(data) < 10:
             context["message"] = "当前数据量过少，请继续采集或导入更多数据后分析。"
             return render_template("mining.html", **context)
@@ -222,18 +332,22 @@ def create_app(test_config: dict | None = None) -> Flask:
                 context["message"] = "当前数据类别不足，暂时无法训练爆款预测模型。"
         return render_template("mining.html", **context)
 
-    def get_spark_analysis() -> dict:
+    def get_spark_analysis(selected_date: str) -> dict:
         return run_spark_analysis(
             Path(app.config["CLEANED_DATA_PATH"]),
             Path(app.config["VIDEO_DATA_PATH"]),
             app.config["HDFS_CMD"],
+            selected_date,
+            app.config["HDFS_WEB_URL"],
+            app.config["HDFS_WEB_USER"],
         )
 
     @app.get("/spark")
     @login_required
     def spark_page():
+        selected_date = selected_business_date()
         try:
-            analysis = get_spark_analysis()
+            analysis = get_spark_analysis(selected_date)
             spark_error = None
         except SparkUnavailableError as error:
             app.logger.warning("Spark 分析不可用：%s", error)
@@ -246,13 +360,14 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "publish_trend": [],
             }
             spark_error = "Spark当前无法启动，请检查Java和PySpark环境。"
-        return render_template("spark.html", analysis=analysis, spark_error=spark_error)
+        return render_template("spark.html", analysis=analysis, spark_error=spark_error, selected_date=selected_date)
 
     @app.get("/api/spark/analysis")
     @login_required
     def spark_analysis_api():
+        selected_date = selected_business_date()
         try:
-            return jsonify(get_spark_analysis())
+            return jsonify({**get_spark_analysis(selected_date), "selected_date": selected_date})
         except SparkUnavailableError as error:
             app.logger.warning("Spark 分析接口不可用：%s", error)
             return jsonify({"error": "Spark当前无法启动，请检查Java和PySpark环境。"})
@@ -260,6 +375,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.route("/data", methods=["GET", "POST"])
     @admin_required
     def data_management():
+        selected_date = selected_business_date()
         raw_path = Path(app.config["VIDEO_DATA_PATH"])
         cleaned_path = Path(app.config["CLEANED_DATA_PATH"])
         summary_path = Path(app.config["CLEANING_SUMMARY_PATH"])
@@ -287,11 +403,13 @@ def create_app(test_config: dict | None = None) -> Flask:
                 return redirect(url_for("data_management"))
 
             imported_count = len(normalized_data)
-            total_count = append_video_data(normalized_data, raw_path)
+            with DATA_PIPELINE_LOCK:
+                total_count = append_video_data(normalized_data, raw_path)
+                run_post_collection_pipeline()
             flash(f"本次成功导入 {imported_count} 条视频数据，当前数据集共有 {total_count} 条数据。", "success")
             return redirect(url_for("data_management"))
 
-        video_data = load_cleaned_data(cleaned_path) if cleaned_path.exists() else load_video_data(raw_path)
+        video_data, data_source = load_selected_data(selected_date)
         raw_total_count = len(load_video_data(raw_path))
         hdfs_available, hdfs_message = check_hdfs_available(
             app.config["HDFS_CMD"],
@@ -310,7 +428,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             "data.html",
             total_count=len(video_data),
             recent_videos=recent_videos,
-            data_source="清洗数据" if cleaned_path.exists() else "原始数据",
+            data_source=display_data_source(data_source),
+            selected_date=selected_date,
+            no_data=video_data.empty,
+            daily_pipeline_status=load_daily_pipeline_status(Path(app.config["DAILY_PIPELINE_STATUS_PATH"])),
             cleaning_summary=get_cleaning_summary(raw_path, cleaned_path, summary_path),
             hdfs_available=hdfs_available,
             hdfs_message=hdfs_message,
@@ -351,7 +472,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         raw_path = Path(app.config["VIDEO_DATA_PATH"])
         try:
             existing_urls = set(get_supported_video_urls(raw_path))
-            result = crawl_bilibili_browser(keyword, limit)
+            result = crawl_bilibili_browser(keyword, limit, data_path=raw_path)
             if int(result["saved_count"]) > 0:
                 current_urls = get_supported_video_urls(raw_path)
                 new_urls = [url for url in current_urls if url not in existing_urls]
@@ -365,10 +486,15 @@ def create_app(test_config: dict | None = None) -> Flask:
                         batch.get("status"),
                         batch.get("updated_count"),
                         batch.get("remaining_count"),
-                    )
+                    ),
+                    data_path=raw_path,
+                    state_path=Path(app.config["INTERACTION_BACKFILL_STATE_PATH"]),
                 )
+                run_post_collection_pipeline()
         except Exception as error:
             app.logger.exception("浏览器采集无法启动：%s", error)
+            if result is not None and int(result.get("saved_count", 0)) > 0:
+                run_post_collection_pipeline()
             if result is None:
                 flash("浏览器采集无法启动，请确认Microsoft Edge未被项目其他采集任务占用。", "danger")
             else:
@@ -439,7 +565,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("data_management"))
 
         try:
-            result = backfill_bilibili_interactions(limit=50)
+            result = backfill_bilibili_interactions(
+                limit=50,
+                data_path=Path(app.config["VIDEO_DATA_PATH"]),
+                state_path=Path(app.config["INTERACTION_BACKFILL_STATE_PATH"]),
+            )
+            if int(result["updated_count"]) > 0:
+                run_post_collection_pipeline()
         except Exception as error:
             app.logger.exception("浏览器互动数据回填失败：%s", error)
             flash("互动数据回填无法启动，请确认Microsoft Edge未被项目其他采集任务占用。", "danger")
@@ -509,7 +641,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("data_management"))
 
         raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        total_count = append_video_data(normalize_columns(crawled_data), raw_path)
+        with DATA_PIPELINE_LOCK:
+            total_count = append_video_data(normalize_columns(crawled_data), raw_path)
+            run_post_collection_pipeline()
         crawl_status = crawled_data.attrs.get("crawl_status", "completed")
         crawl_message = crawled_data.attrs.get("crawl_message", "")
         session["crawl_result"] = {
@@ -540,7 +674,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             flash("暂无可清洗的视频数据，请先使用 B 站采集。", "danger")
             return redirect(url_for("data_management"))
 
-        summary = clean_video_data(raw_path, cleaned_path, summary_path)
+        with DATA_PIPELINE_LOCK:
+            summary = clean_video_data(raw_path, cleaned_path, summary_path)
         flash(
             f"数据清洗完成：原始 {summary['raw_count']} 条，清洗后 {summary['cleaned_count']} 条，删除重复 {summary['duplicate_count']} 条。",
             "success",
@@ -593,10 +728,25 @@ def create_app(test_config: dict | None = None) -> Flask:
         flash("HDFS文件存在，读取成功。", "success")
         return redirect(url_for("data_management"))
 
+    @app.post("/data/daily-pipeline/run")
+    @admin_required
+    def run_daily_pipeline_now():
+        result = run_daily_pipeline(config=app.config)
+        flash(
+            f"昨日任务执行完成：目标日期 {result['target_date']}，新增 {result['added_count']} 条。",
+            "success" if not result["error_summary"] else "warning",
+        )
+        return redirect(url_for("data_management", date=result["target_date"]))
+
     @app.errorhandler(403)
     def forbidden(_error):
         return render_template("403.html"), 403
 
+    @app.errorhandler(InvalidBusinessDateError)
+    def invalid_business_date(error):
+        return render_template("date_error.html", message=str(error)), 400
+
+    start_scheduler(app)
     return app
 
 

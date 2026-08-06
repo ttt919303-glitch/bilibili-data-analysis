@@ -59,7 +59,11 @@ def test_admin_can_start_interaction_backfill_and_see_summary(tmp_path):
         response = client.post("/data/browser-backfill", follow_redirects=True)
 
     page = response.get_data(as_text=True)
-    backfill.assert_called_once_with(limit=50)
+    backfill.assert_called_once_with(
+        limit=50,
+        data_path=tmp_path / "videos.csv",
+        state_path=tmp_path / "interaction_backfill_state.json",
+    )
     assert "互动数据回填完成" in page
     assert "成功回填：50条" in page
 
