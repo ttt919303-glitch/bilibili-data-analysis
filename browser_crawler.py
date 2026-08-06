@@ -303,11 +303,13 @@ def crawl_bilibili_browser(
     keyword: str,
     limit: int,
     progress: Callable[[dict[str, int]], None] | None = None,
+    *,
+    data_path: Path | None = None,
 ) -> dict[str, object]:
     if not 1 <= limit <= MAX_CRAWL_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_CRAWL_LIMIT}")
 
-    data_path = get_video_data_path()
+    data_path = Path(data_path) if data_path is not None else get_video_data_path()
     existing_urls = _existing_video_urls(data_path)
     seen_page_urls = set()
     previous_page_url = ""

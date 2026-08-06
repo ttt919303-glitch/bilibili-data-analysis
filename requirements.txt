@@ -5,3 +5,6 @@ pyspark==3.5.7
 scikit-learn==1.6.1
 mlxtend==0.23.4
 playwright
+langchain-core>=0.3,<2
+langchain-text-splitters>=0.3,<2
+APScheduler>=3.10,<4

@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import subprocess
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
+import pandas as pd
+
+from data_utils import load_video_data
+
 HDFS_DATA_PATH = "/bilibili/videos_cleaned.csv"
 DEFAULT_WEBHDFS_USER = "tan"
 WEBHDFS_TIMEOUT_SECONDS = 15
+
+
+class DataSourceUnavailableError(RuntimeError):
+    """Raised when neither HDFS nor an allowed local CSV source can be read."""
 
 
 def _run_hdfs(command: list[str]) -> tuple[bool, str, str]:
@@ -248,3 +257,61 @@ def read_hdfs_preview(
     if not success:
         return False, error
     return True, "\n".join(output.splitlines()[:line_count])
+
+
+def _read_webhdfs_text(hdfs_url: str, hdfs_user: str) -> str:
+    opener = build_opener(_NoRedirectHandler())
+    opened, output, location, error = _webhdfs_request(
+        hdfs_url,
+        HDFS_DATA_PATH,
+        "OPEN",
+        hdfs_user,
+        "GET",
+        opener=opener,
+    )
+    if not opened:
+        raise DataSourceUnavailableError(error)
+    if location:
+        read, output, _location, error = _request_url(
+            _rewrite_datanode_location(location, hdfs_url), "GET", opener=opener
+        )
+        if not read:
+            raise DataSourceUnavailableError(error)
+    return output
+
+
+def _parse_csv_text(content: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(StringIO(content), dtype=object, keep_default_na=False)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as error:
+        raise DataSourceUnavailableError(f"HDFS CSV读取失败：{error}") from error
+
+
+def load_analysis_dataframe(
+    cleaned_path: Path,
+    raw_path: Path,
+    hdfs_cmd: str,
+    hdfs_url: str | None,
+    hdfs_user: str,
+    allow_local_fallback: bool = True,
+) -> tuple[pd.DataFrame, str]:
+    """Load analysis data in HDFS, cleaned CSV, then raw CSV priority order."""
+    hdfs_error = ""
+    try:
+        if hdfs_url:
+            return _parse_csv_text(_read_webhdfs_text(hdfs_url, hdfs_user)), "HDFS（WebHDFS）"
+        success, output, error = _run_hdfs([hdfs_cmd, "dfs", "-cat", HDFS_DATA_PATH])
+        if success:
+            return _parse_csv_text(output), "HDFS（命令行）"
+        hdfs_error = error
+    except (DataSourceUnavailableError, OSError) as error:
+        hdfs_error = str(error)
+
+    if not allow_local_fallback:
+        raise DataSourceUnavailableError(hdfs_error or "HDFS数据不可用。")
+
+    if cleaned_path.exists() and cleaned_path.stat().st_size > 0:
+        return load_video_data(cleaned_path), "本地清洗CSV（HDFS不可用，已回退）"
+    if raw_path.exists() and raw_path.stat().st_size > 0:
+        return load_video_data(raw_path), "本地原始CSV（HDFS及清洗数据不可用，已回退）"
+    return load_video_data(raw_path), "无可用数据"

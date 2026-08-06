@@ -8,11 +8,12 @@
     <h1 class="h3 mb-2">Spark 数据分析</h1>
     <p class="text-secondary mb-0">分析引擎：PySpark Local Mode；数据来源：{{ analysis.source }}</p>
   </section>
+  {% include '_date_filter.html' %}
 
   {% if spark_error %}
     <div class="alert alert-warning">{{ spark_error }}</div>
   {% elif analysis.total_count == 0 %}
-    <div class="alert alert-info">暂无可分析数据，请先完成数据采集和清洗。</div>
+    <div class="alert alert-info">该日期暂无数据。暂无可分析数据，请先完成数据采集和清洗。</div>
   {% endif %}
 
   <section class="card mb-4">

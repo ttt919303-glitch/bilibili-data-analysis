@@ -6,6 +6,9 @@
     <h1 class="h3 mb-2">欢迎使用视频数据分析系统</h1>
     <p class="text-secondary mb-0">数据统计实时读取 data/videos.csv，导入 CSV 后会自动更新。</p>
   </section>
+  {% include '_date_filter.html' %}
+  <p class="text-secondary">当前数据来源：{{ data_source }}</p>
+  {% if no_data %}<div class="alert alert-info">该日期暂无数据</div>{% endif %}
   <section class="row g-3">
     <div class="col-sm-6 col-xl-3">
       <article class="card stat-card h-100"><div class="card-body"><p>视频总数</p><strong id="video-total">{{ '{:,}'.format(statistics.video_total) }}</strong><span>当前数据集记录数</span></div></article>

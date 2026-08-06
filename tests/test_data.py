@@ -61,11 +61,11 @@ def test_admin_can_open_data_management(tmp_path):
 def test_admin_can_import_csv_and_view_recent_videos(tmp_path):
     client, data_path = create_client(tmp_path)
     login(client, "admin", "admin123")
-    csv_content = "标题,UP主,播放量,点赞\n视频甲,UP主甲,1.2万,300\n视频乙,UP主乙,5000,120\n"
+    csv_content = "标题,UP主,播放量,点赞,发布时间\n视频甲,UP主甲,1.2万,300,2026-08-06\n视频乙,UP主乙,5000,120,2026-08-06\n"
 
     response = client.post(
         "/data",
-        data={"file": (BytesIO(csv_content.encode("utf-8")), "videos.csv")},
+        data={"date": "2026-08-06", "file": (BytesIO(csv_content.encode("utf-8")), "videos.csv")},
         content_type="multipart/form-data",
         follow_redirects=True,
     )
@@ -97,13 +97,13 @@ def test_home_reads_real_statistics_from_videos_csv(tmp_path):
     client, data_path = create_client(tmp_path)
     data_path.write_text(
         "title,video_url,up_name,play_count,like_count,coin_count,favorite_count,share_count,comment_count,publish_time,crawl_date\n"
-        "视频甲,,UP主甲,12000,300,0,0,0,0,,2026-07-30\n"
-        "视频乙,,UP主甲,5000,120,0,0,0,0,,2026-07-30\n",
+        "视频甲,,UP主甲,12000,300,0,0,0,0,2026-07-30,2026-07-30\n"
+        "视频乙,,UP主甲,5000,120,0,0,0,0,2026-07-30,2026-07-30\n",
         encoding="utf-8",
     )
     login(client, "user", "user123")
 
-    response = client.get("/")
+    response = client.get("/?date=2026-07-30")
 
     page = response.get_data(as_text=True)
     assert 'id="video-total">2' in page
@@ -121,7 +121,7 @@ def test_data_table_shows_collection_date_separately_from_publish_time(tmp_path)
     )
     login(client, "admin", "admin123")
 
-    response = client.get("/data")
+    response = client.get("/data?date=2024-01-02")
 
     page = response.get_data(as_text=True)
     assert response.status_code == 200

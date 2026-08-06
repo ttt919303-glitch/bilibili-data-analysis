@@ -11,6 +11,8 @@ data/*.log
 data/*.err.log
 data/interaction_backfill_state.json
 data/replacement_plan.json
+data/daily_pipeline_status.json
+data/knowledge_base/
 __pycache__/
 tests/__pycache__/
 *.pyc

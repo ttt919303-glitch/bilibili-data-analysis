@@ -385,12 +385,14 @@ def _failure_reason(error: Exception) -> str:
 def backfill_bilibili_interactions(
     limit: int = BACKFILL_LIMIT,
     target_urls: Iterable[str] | None = None,
+    data_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, object]:
     if not 1 <= limit <= BACKFILL_LIMIT:
         raise ValueError(f"limit must be between 1 and {BACKFILL_LIMIT}")
 
-    data_path = get_video_data_path()
-    state_path = get_backfill_state_path()
+    data_path = Path(data_path) if data_path is not None else get_video_data_path()
+    state_path = Path(state_path) if state_path is not None else get_backfill_state_path()
     data = _load_backfill_data(data_path)
     completed_urls, failed_urls = _load_backfill_state(state_path)
     video_urls = _target_video_urls(data, target_urls)
