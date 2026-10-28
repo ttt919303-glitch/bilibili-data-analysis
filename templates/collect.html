@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}数据采集 - 大数据课程项目{% endblock %}
+
+{% block content %}
+<section class="card">
+    <h1>B 站视频数据采集</h1>
+    <p>若要持续构建同一课程数据集，请多次采集时选择相同的数据归属日期。</p>
+    <form id="collect-form">
+        <label for="keyword">关键词</label>
+        <input id="keyword" name="keyword" type="text" required>
+
+        <label for="collect-date">数据归属日期</label>
+        <input id="collect-date" name="date" type="date" value="{{ selected_date }}" required>
+
+        <label for="target-count">本次希望新增数量</label>
+        <input id="target-count" name="target_count" type="number" min="1" max="50000" value="20" required>
+
+        <button type="submit">开始采集</button>
+    </form>
+</section>
+
+<section class="card" aria-live="polite">
+    <h2>课程数据集进度（所选日期）</h2>
+    <p>数据归属日期：{{ selected_date }}</p>
+    <p>课程目标：<span id="course-target">{{ course_target }}</span> 条不同 BV</p>
+    {% if existing_count is none %}
+    <p>当前所选日期原始数据：<span id="course-current">--</span></p>
+    <p class="danger">无法读取数据量，请检查HDFS</p>
+    {% else %}
+    <p>当前所选日期原始数据：<span id="course-current">{{ existing_count }}</span> 条</p>
+    <p>完成度：<span id="course-progress">{{ '%.2f'|format(completion_percent) }}%</span></p>
+    <div class="progress" role="progressbar" aria-label="课程数据集完成度" aria-valuenow="{{ completion_percent }}" aria-valuemin="0">
+        <div class="progress-bar" style="width: {{ '%.2f'|format(progress_width) }}%"></div>
+    </div>
+    {% if existing_count >= course_target %}
+    <p class="success">已达到课程数据量目标</p>
+    {% endif %}
+    {% endif %}
+    <p class="muted">不同数据归属日期独立统计，切换日期不会删除其他日期的数据。</p>
+</section>
+
+<section class="card" aria-live="polite">
+    <h2>任务信息</h2>
+    <p>状态：<span id="task-status">未开始</span></p>
+    <p>关键词：<span id="task-keyword">--</span></p>
+    <p>本次希望新增：<span id="task-target-count">--</span> 条</p>
+    <p>采集前已有：<span id="task-existing-count">--</span> 条</p>
+    <p>本次实际新增：<span id="task-added-count">0</span> 条</p>
+    <p class="visually-hidden">本次实际新增兼容值：<span id="success-count">0</span></p>
+    <p>当前原始数据总量：<span id="task-total-count">--</span> 条</p>
+    <p>课程目标：<span id="task-course-target">{{ course_target }}</span> 条</p>
+    <p>完成度：<span id="task-course-progress">--</span></p>
+    <p id="task-message"></p>
+    <p id="poll-error" class="danger"></p>
+</section>
+
+<section class="card" aria-live="polite">
+    <h2>数据清洗</h2>
+    <form id="clean-form">
+        <label for="clean-date">清洗日期</label>
+        <input id="clean-date" name="date" type="date" value="{{ selected_date }}" required>
+        <button type="submit">开始数据清洗</button>
+    </form>
+    <p>本次清洗日期：<span id="clean-result-date">--</span></p>
+    <p>清洗前：<span id="clean-before">--</span> 条</p>
+    <p>清洗后：<span id="clean-after">--</span> 条</p>
+    <p>删除/去重：<span id="clean-removed">--</span> 条</p>
+    <p>清洗状态：<span id="clean-status">未开始</span></p>
+    <p id="clean-message"></p>
+</section>
+
+<section class="card">
+    <h2>最新原始采集数据</h2>
+    <p id="latest-videos-note"></p>
+    <p>仅展示该日期最近10条原始数据，完整数据量以上方统计为准。</p>
+    <p><a href="{{ url_for('data_page', date=selected_date) }}">前往数据查询页面</a></p>
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>标题</th>
+                    <th>UP 主</th>
+                    <th>播放</th>
+                    <th>点赞</th>
+                    <th>投币</th>
+                    <th>收藏</th>
+                    <th>分享</th>
+                </tr>
+            </thead>
+            <tbody id="latest-videos"></tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+{% endblock %}

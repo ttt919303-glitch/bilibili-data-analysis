@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Spark 可视化 - 大数据课程项目{% endblock %}
+
+{% block content %}
+<section class="card control-card">
+    <h1>Spark 视频分析</h1>
+    <form class="compact-form compact-form-short" method="get" action="{{ url_for('visualization_page') }}">
+        <div class="form-field">
+            <label for="date">数据日期</label>
+            <input id="date" name="date" type="date" value="{{ selected_date }}">
+        </div>
+        <button type="submit">分析</button>
+    </form>
+</section>
+
+{% if error %}
+    <p class="alert danger">{{ error }}</p>
+{% endif %}
+
+{% if analysis %}
+<section class="chart-grid">
+    <article class="card chart-card">
+        <h2>UP 主视频数量 TOP10</h2>
+        <div id="chart-up-count" class="chart"></div>
+    </article>
+    <article class="card chart-card">
+        <h2>播放量 TOP10</h2>
+        <div id="chart-top-views" class="chart"></div>
+    </article>
+    <article class="card chart-card">
+        <h2>点赞数 TOP10</h2>
+        <div id="chart-top-likes" class="chart"></div>
+    </article>
+    <article class="card chart-card">
+        <h2>互动量 TOP10</h2>
+        <div id="chart-interactions" class="chart"></div>
+    </article>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script>
+    const analysis = {{ analysis|tojson }};
+
+    function formatAxisLabel(name) {
+        return name.length > 10 ? `${name.slice(0, 10)}…` : name;
+    }
+
+    function renderChart(containerId, data) {
+        const chart = echarts.init(document.getElementById(containerId));
+        chart.setOption({
+            tooltip: {
+                trigger: 'axis',
+                appendToBody: true,
+                confine: true,
+                extraCssText: 'max-width: 320px; white-space: normal; overflow-wrap: anywhere;',
+                position: (point, items, element, target, size) => [
+                    Math.max(8, Math.min(point[0] + 12, size.viewSize[0] - size.contentSize[0] - 8)),
+                    Math.max(8, Math.min(
+                        point[1] - size.contentSize[1] / 2,
+                        size.viewSize[1] - size.contentSize[1] - 8
+                    ))
+                ],
+                formatter: (items) => `名称：${items[0].data.name}<br>数值：${items[0].value}`
+            },
+            grid: { left: 60, right: 24, top: 24, bottom: 110, containLabel: true },
+            xAxis: {
+                type: 'category',
+                data: data.map((item) => item.name),
+                axisLabel: { interval: 0, rotate: 45, formatter: formatAxisLabel }
+            },
+            yAxis: { type: 'value' },
+            series: [{
+                type: 'bar',
+                data: data,
+                itemStyle: { color: '#16a36a' }
+            }]
+        });
+    }
+
+    if (analysis) {
+        renderChart('chart-up-count', analysis.up_video_count);
+        renderChart('chart-top-views', analysis.top_views);
+        renderChart('chart-top-likes', analysis.top_likes);
+        renderChart('chart-interactions', analysis.top_interactions);
+    }
+</script>
+{% endblock %}

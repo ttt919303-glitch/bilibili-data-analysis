@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}AI 知识库 - 大数据课程项目{% endblock %}
+
+{% block content %}
+<section class="card">
+    <h1>AI 知识库</h1>
+    <form method="post" action="{{ url_for('knowledge_page', date=selected_date) }}">
+        <label for="date">数据日期</label>
+        <input id="date" name="date" type="date" value="{{ selected_date }}">
+        <label for="question">问题</label>
+        <input id="question" name="question" value="{{ question }}" placeholder="例如：播放量最高的视频是哪个？">
+        <button type="submit">提问</button>
+    </form>
+</section>
+
+{% if error %}
+<section class="card">
+    <p class="alert danger">{{ error }}</p>
+</section>
+{% elif answer %}
+<section class="card">
+    <h2>回答</h2>
+    <pre>{{ answer }}</pre>
+</section>
+{% endif %}
+{% endblock %}

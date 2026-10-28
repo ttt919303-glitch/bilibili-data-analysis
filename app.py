@@ -1,605 +1,751 @@
-from __future__ import annotations
-
-import sqlite3
-import os
-import threading
-from datetime import datetime
 from functools import wraps
-from pathlib import Path
+import threading
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
-import pandas as pd
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
-from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.utils import secure_filename
+import pymysql
+from flask import Flask, current_app, flash, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash
 
-from data_utils import (
-    REQUIRED_COLUMNS,
-    append_video_data,
-    clean_video_data,
-    get_cleaning_summary,
-    load_cleaned_data,
-    load_video_data,
-    normalize_columns,
-    parse_number,
+from analysis.mining import MiningDataError, run_apriori, run_hot_prediction, run_kmeans
+from analysis.spark_analysis import run_spark_analysis
+from collector.bilibili_collector import CollectorError, clean_video_data, collect
+from config import Config
+from knowledge.qa import answer_question, build_retriever
+from scheduler.jobs import build_scheduler
+from services.database_initializer import initialize_database
+from services.hdfs_service import (
+    HdfsServiceError,
+    read_from_hdfs,
+    read_raw_from_hdfs,
+    save_raw_to_hdfs,
+    save_to_hdfs,
 )
-from hdfs_utils import check_hdfs_available, check_hdfs_file, read_hdfs_preview, upload_cleaned_to_hdfs
-from crawler import CrawlerError, crawl_bilibili
-from browser_crawler import crawl_bilibili_browser
-from browser_interaction_backfill import backfill_bilibili_interactions, get_supported_video_urls
-from run_interaction_backfill import run_target_batches
-from spark_analysis import SparkUnavailableError, run_spark_analysis
-from mining import load_mining_data, run_association_rules, run_kmeans, train_hot_model, predict_hot_video, MODEL_FEATURES
-from qa import answer_question, load_qa_data
-
-PROJECT_DIR = Path(__file__).resolve().parent
-BROWSER_CRAWL_LIMIT = 200
-browser_crawl_lock = threading.Lock()
 
 
-def get_db() -> sqlite3.Connection:
-    """获取当前请求使用的 SQLite 连接。"""
-    if "db" not in g:
-        connection = sqlite3.connect(g.app.config["DATABASE"])
-        connection.row_factory = sqlite3.Row
-        g.db = connection
-    return g.db
+TASK_UPDATE_COLUMNS = {"success_count", "status", "finished_at", "message"}
+TASK_PROGRESS = {}
+TASK_PROGRESS_LOCK = threading.Lock()
+COLLECTION_DATE_LOCKS = {}
+COLLECTION_DATE_LOCKS_GUARD = threading.Lock()
+PAGE_SIZE = 20
+SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
+HDFS_CONNECTION_ERROR = "连接 HDFS 失败，请检查 Hadoop/HDFS 是否启动。"
 
 
-def initialize_users() -> None:
-    """创建 users 表，并写入课程演示所需的两个固定账号。"""
-    db = get_db()
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('admin', 'user'))
+def yesterday_string(now: Optional[datetime] = None) -> str:
+    reference_time = now or datetime.now()
+    return (reference_time.date() - timedelta(days=1)).isoformat()
+
+
+def current_local_datetime() -> datetime:
+    return datetime.now(SHANGHAI_TIMEZONE)
+
+
+def run_scheduled_collection(app: Flask) -> None:
+    with app.app_context():
+        collect_date = yesterday_string(current_local_datetime())
+        keyword = app.config["DEFAULT_KEYWORD"]
+        target_count = app.config["DEFAULT_TARGET_COUNT"]
+        task_id = create_task(keyword, target_count, collect_date)
+        app.logger.info(
+            "Scheduled collection task created: task_id=%s, keyword=%s, target_count=%s, collect_date=%s",
+            task_id,
+            keyword,
+            target_count,
+            collect_date,
         )
-        """
+        run_collection_task(app, task_id, keyword, target_count, collect_date)
+
+
+def selected_date(value: Optional[str]) -> str:
+    if value is None or value == "":
+        return yesterday_string()
+
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("日期必须为 YYYY-MM-DD 格式") from exc
+    if parsed.isoformat() != value:
+        raise ValueError("日期必须为 YYYY-MM-DD 格式")
+    return value
+
+
+def get_db_connection() -> pymysql.Connection:
+    return pymysql.connect(
+        host=current_app.config["MYSQL_HOST"],
+        port=current_app.config["MYSQL_PORT"],
+        user=current_app.config["MYSQL_USER"],
+        password=current_app.config["MYSQL_PASSWORD"],
+        database=current_app.config["MYSQL_DATABASE"],
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
     )
-    users = (
-        ("admin", "admin123", "admin"),
-        ("user", "user123", "user"),
-    )
-    for username, password, role in users:
-        db.execute(
-            "INSERT OR IGNORE INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-            (username, generate_password_hash(password), role),
-        )
-    db.commit()
+
+
+def find_user(username: str) -> Optional[dict]:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+            return cursor.fetchone()
+
+
+def create_task(keyword: str, target_count: int, collect_date: str) -> int:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO collection_tasks
+                    (keyword, target_count, success_count, status, collect_date, message)
+                VALUES (%s, %s, 0, 'waiting', %s, '')
+                """,
+                (keyword, target_count, collect_date),
+            )
+            return cursor.lastrowid
+
+
+def update_task(task_id: int, **values) -> None:
+    if not values:
+        raise ValueError("Task update cannot be empty")
+
+    invalid_columns = set(values) - TASK_UPDATE_COLUMNS
+    if invalid_columns:
+        raise ValueError(f"Unsupported task columns: {sorted(invalid_columns)}")
+
+    assignments = ", ".join(f"{column} = %s" for column in values)
+    parameters = (*values.values(), task_id)
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE collection_tasks SET {assignments} WHERE id = %s",
+                parameters,
+            )
+
+
+def get_task(task_id: int) -> Optional[dict]:
+    with get_db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM collection_tasks WHERE id = %s", (task_id,))
+            return cursor.fetchone()
+
+
+def latest_videos(collect_date: str, limit: int = 10) -> list:
+    return list(reversed(read_raw_from_hdfs(collect_date)))[:limit]
+
+
+def unique_bvids(records: list) -> set:
+    return {record["bvid"] for record in records if record.get("bvid")}
+
+
+def _set_task_progress(task_id: int, existing_count: int, added_count: int) -> None:
+    with TASK_PROGRESS_LOCK:
+        TASK_PROGRESS[task_id] = {
+            "existing_count": existing_count,
+            "added_count": added_count,
+            "total_count": existing_count + added_count,
+        }
+
+
+def _get_task_progress(task_id: int) -> dict:
+    with TASK_PROGRESS_LOCK:
+        return TASK_PROGRESS.get(
+            task_id,
+            {"existing_count": None, "added_count": 0, "total_count": None},
+        ).copy()
+
+
+def _collection_lock_for_date(collect_date: str) -> threading.Lock:
+    with COLLECTION_DATE_LOCKS_GUARD:
+        return COLLECTION_DATE_LOCKS.setdefault(collect_date, threading.Lock())
+
+
+def run_collection_task(
+    app: Flask,
+    task_id: int,
+    keyword: str,
+    target_count: int,
+    collect_date: str,
+) -> None:
+    with app.app_context():
+        with _collection_lock_for_date(collect_date):
+            try:
+                update_task(task_id, status="running", message="")
+                existing_records = read_raw_from_hdfs(collect_date)
+                existing_bvids = unique_bvids(existing_records)
+                existing_count = len(existing_bvids)
+                _set_task_progress(task_id, existing_count, 0)
+                app.logger.info(
+                    "Collection task started: task_id=%s, keyword=%s, target_count=%s, "
+                    "collect_date=%s, existing_count=%s",
+                    task_id,
+                    keyword,
+                    target_count,
+                    collect_date,
+                    existing_count,
+                )
+                raw_videos = collect(
+                    keyword,
+                    target_count,
+                    collect_date,
+                    exclude_bvids=existing_bvids,
+                    task_id=task_id,
+                )
+                if not raw_videos:
+                    app.logger.info(
+                        "Collection task found no new videos: task_id=%s, keyword=%s, "
+                        "existing_count=%s, new_bvid_count=0",
+                        task_id,
+                        keyword,
+                        existing_count,
+                    )
+                    update_task(
+                        task_id,
+                        status="failed",
+                        success_count=0,
+                        finished_at=datetime.now(),
+                        message="该关键词未发现新的唯一视频",
+                    )
+                    return
+
+                added_count = save_raw_to_hdfs(raw_videos, collect_date)
+                total_count = len(unique_bvids(read_raw_from_hdfs(collect_date)))
+                _set_task_progress(task_id, existing_count, added_count)
+                if added_count == 0:
+                    update_task(
+                        task_id,
+                        status="failed",
+                        success_count=0,
+                        finished_at=datetime.now(),
+                        message="该关键词未发现新的唯一视频",
+                    )
+                    return
+                message = "采集完成"
+                if added_count < target_count:
+                    message = f"目标新增{target_count}条，实际新增{added_count}条"
+                update_task(
+                    task_id,
+                    status="success",
+                    success_count=added_count,
+                    finished_at=datetime.now(),
+                    message=message,
+                )
+                app.logger.info(
+                    "Collection task raw data saved: task_id=%s, collect_date=%s, "
+                    "existing_count=%s, added_count=%s, total_count=%s, raw_path=%s",
+                    task_id,
+                    collect_date,
+                    existing_count,
+                    added_count,
+                    total_count,
+                    f"/bigdata_course/bilibili/date={collect_date}/videos_raw.jsonl",
+                )
+            except CollectorError:
+                app.logger.exception(
+                    "Collection task failed: task_id=%s, keyword=%s, collect_date=%s",
+                    task_id,
+                    keyword,
+                    collect_date,
+                )
+                update_task(
+                    task_id,
+                    status="failed",
+                    success_count=0,
+                    finished_at=datetime.now(),
+                    message="B站数据采集失败，请检查网络连接或接口状态。",
+                )
+            except HdfsServiceError:
+                app.logger.exception(
+                    "Collection task failed: task_id=%s, keyword=%s, collect_date=%s",
+                    task_id,
+                    keyword,
+                    collect_date,
+                )
+                update_task(
+                    task_id,
+                    status="failed",
+                    success_count=0,
+                    finished_at=datetime.now(),
+                    message="数据保存到 HDFS 失败，请检查 Hadoop/HDFS 是否启动。",
+                )
+            except Exception as exc:
+                app.logger.exception(
+                    "Collection task failed: task_id=%s, keyword=%s, collect_date=%s",
+                    task_id,
+                    keyword,
+                    collect_date,
+                )
+                update_task(
+                    task_id,
+                    status="failed",
+                    success_count=0,
+                    finished_at=datetime.now(),
+                    message=str(exc)[:500],
+                )
+
+
+def _parse_collect_request(payload: object) -> tuple:
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    keyword = payload.get("keyword")
+    collect_date = payload.get("date")
+    target_count = payload.get("target_count")
+    if not isinstance(keyword, str) or not keyword.strip():
+        raise ValueError("关键字不能为空")
+    if not isinstance(collect_date, str) or not collect_date:
+        raise ValueError("日期必须为 YYYY-MM-DD 格式")
+    collect_date = selected_date(collect_date)
+    if isinstance(target_count, bool) or not isinstance(target_count, int):
+        raise ValueError("目标数量必须是整数")
+    if not 1 <= target_count <= 50000:
+        raise ValueError("目标数量必须在 1 到 50000 之间")
+    return keyword.strip(), target_count, collect_date
+
+
+def _date_string(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()[:10]
+    return str(value)
 
 
 def login_required(view):
-    """未登录访问业务页面时统一回到登录页。"""
-
     @wraps(view)
-    def wrapped_view(*args, **kwargs):
-        if g.user is None:
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
             return redirect(url_for("login"))
         return view(*args, **kwargs)
 
-    return wrapped_view
+    return wrapped
 
 
 def admin_required(view):
-    """限制数据管理页面仅允许管理员访问。"""
-
     @wraps(view)
-    def wrapped_view(*args, **kwargs):
-        if g.user is None:
-            return redirect(url_for("login"))
-        if g.user["role"] != "admin":
-            abort(403)
+    def wrapped(*args, **kwargs):
+        if session.get("role") != "admin":
+            return {"message": "只有管理员可以执行此操作"}, 403
         return view(*args, **kwargs)
 
-    return wrapped_view
+    return wrapped
 
 
-def create_app(test_config: dict | None = None) -> Flask:
-    """创建课程项目的最小 Flask 应用。"""
+def create_app(test_config: Optional[dict] = None) -> Flask:
     app = Flask(__name__)
-    default_hdfs_web_url = os.getenv("HDFS_WEB_URL")
-    if default_hdfs_web_url is None:
-        default_hdfs_web_url = "" if test_config is not None else "http://192.168.8.140:50070"
-    app.config.from_mapping(
-        SECRET_KEY="course-project-secret-key",
-        DATABASE=PROJECT_DIR / "instance" / "users.db",
-        VIDEO_DATA_PATH=PROJECT_DIR / "data" / "videos.csv",
-        CLEANED_DATA_PATH=PROJECT_DIR / "data" / "videos_cleaned.csv",
-        CLEANING_SUMMARY_PATH=PROJECT_DIR / "data" / "cleaning_summary.json",
-        HDFS_CMD=os.getenv("HDFS_CMD", "hdfs"),
-        HDFS_WEB_URL=default_hdfs_web_url,
-        HDFS_WEB_USER=os.getenv("HDFS_WEB_USER", "tan"),
-        HDFS_DATA_PATH="/bilibili/videos_cleaned.csv",
-        PORT=5052,
-    )
-    if test_config is not None:
+    app.config.from_object(Config)
+    if test_config:
         app.config.update(test_config)
-        if "VIDEO_DATA_PATH" in test_config and "CLEANED_DATA_PATH" not in test_config:
-            test_data_path = Path(app.config["VIDEO_DATA_PATH"])
-            app.config["CLEANED_DATA_PATH"] = test_data_path.with_name("videos_cleaned.csv")
-            app.config["CLEANING_SUMMARY_PATH"] = test_data_path.with_name("cleaning_summary.json")
-
-    Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
-
-    @app.before_request
-    def load_logged_in_user() -> None:
-        g.app = app
-        user_id = session.get("user_id")
-        g.user = None
-        if user_id is not None:
-            g.user = get_db().execute(
-                "SELECT id, username, role FROM users WHERE id = ?", (user_id,)
-            ).fetchone()
-
-    @app.teardown_appcontext
-    def close_db(_error: BaseException | None) -> None:
-        db = g.pop("db", None)
-        if db is not None:
-            db.close()
-
-    with app.app_context():
-        g.app = app
-        initialize_users()
+    initialize_database(app)
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
-        if g.user is not None:
-            return redirect(url_for("home"))
-
         if request.method == "POST":
-            username = request.form.get("username", "").strip()
-            password = request.form.get("password", "")
-            user = get_db().execute(
-                "SELECT id, username, password_hash, role FROM users WHERE username = ?", (username,)
-            ).fetchone()
-
-            if user is not None and check_password_hash(user["password_hash"], password):
+            user = find_user(request.form["username"].strip())
+            if user and check_password_hash(user["password"], request.form["password"]):
                 session.clear()
-                session["user_id"] = user["id"]
-                return redirect(url_for("home"))
-
-            flash("用户名或密码错误，请重新输入。", "danger")
-
+                session.update(
+                    user_id=user["id"], username=user["username"], role=user["role"]
+                )
+                return redirect(url_for("index"))
+            flash("用户名或密码错误", "danger")
         return render_template("login.html")
 
-    @app.post("/logout")
+    @app.route("/")
+    @login_required
+    def index():
+        try:
+            collect_date = selected_date(request.args.get("date"))
+        except ValueError as exc:
+            return str(exc), 400
+
+        try:
+            videos = read_from_hdfs(collect_date)
+        except HdfsServiceError:
+            app.logger.exception("Dashboard HDFS read failed: date=%s", collect_date)
+            metrics = {
+                "video_count": "--",
+                "total_views": "--",
+                "total_likes": "--",
+                "total_coins": "--",
+            }
+            top_videos = []
+            error = HDFS_CONNECTION_ERROR
+        else:
+            metrics = {
+                "video_count": len(videos),
+                "total_views": sum(video["view_count"] for video in videos),
+                "total_likes": sum(video["like_count"] for video in videos),
+                "total_coins": sum(video["coin_count"] for video in videos),
+            }
+            top_videos = sorted(
+                videos, key=lambda video: video["view_count"], reverse=True
+            )[:5]
+            error = None
+        app.logger.info(
+            "Dashboard loaded: date=%s, video_count=%s",
+            collect_date,
+            metrics["video_count"],
+        )
+        return render_template(
+            "index.html",
+            selected_date=collect_date,
+            metrics=metrics,
+            top_videos=top_videos,
+            error=error,
+        )
+
+    @app.get("/data")
+    @login_required
+    def data_page():
+        try:
+            collect_date = selected_date(request.args.get("date"))
+        except ValueError as exc:
+            return str(exc), 400
+
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            return "页码必须是整数", 400
+        if page < 1:
+            return "页码必须大于或等于 1", 400
+
+        query = request.args.get("q", "")
+        query_key = query.casefold()
+        try:
+            videos = read_from_hdfs(collect_date)
+        except HdfsServiceError:
+            app.logger.exception("Data page HDFS read failed: date=%s", collect_date)
+            videos = []
+            dataset_count = None
+            error = HDFS_CONNECTION_ERROR
+        else:
+            dataset_count = len(videos)
+            error = None
+        filtered_videos = [
+            video
+            for video in videos
+            if query_key in video["title"].casefold()
+            or query_key in video["up_name"].casefold()
+        ]
+        start = (page - 1) * PAGE_SIZE
+        total_pages = (len(filtered_videos) + PAGE_SIZE - 1) // PAGE_SIZE
+        app.logger.info(
+            "Data query loaded: date=%s, query=%s, page=%s, result_count=%s",
+            collect_date,
+            query,
+            page,
+            len(filtered_videos),
+        )
+        return render_template(
+            "data.html",
+            selected_date=collect_date,
+            query=query,
+            videos=filtered_videos[start : start + PAGE_SIZE],
+            page=page,
+            total_pages=total_pages,
+            dataset_count=dataset_count,
+            error=error,
+        )
+
+    @app.get("/mining")
+    @login_required
+    def mining_page():
+        try:
+            collect_date = selected_date(request.args.get("date"))
+        except ValueError as exc:
+            return str(exc), 400
+
+        results = {}
+        errors = {}
+        try:
+            videos = read_from_hdfs(collect_date)
+        except HdfsServiceError:
+            app.logger.exception("Mining page HDFS read failed: date=%s", collect_date)
+            videos = []
+            error = HDFS_CONNECTION_ERROR
+            no_data = False
+        else:
+            error = None
+            no_data = not videos
+            if videos:
+                algorithms = {
+                    "kmeans": run_kmeans,
+                    "hot_prediction": run_hot_prediction,
+                    "apriori": run_apriori,
+                }
+                for name, algorithm in algorithms.items():
+                    try:
+                        results[name] = algorithm(videos)
+                    except MiningDataError as exc:
+                        errors[name] = str(exc)
+                        app.logger.warning(
+                            "Mining algorithm unavailable: algorithm=%s, date=%s, reason=%s",
+                            name,
+                            collect_date,
+                            exc,
+                        )
+
+        app.logger.info(
+            "Mining page loaded: date=%s, video_count=%s, errors=%s",
+            collect_date,
+            len(videos),
+            sorted(errors),
+        )
+        return render_template(
+            "mining.html",
+            selected_date=collect_date,
+            results=results,
+            errors=errors,
+            error=error,
+            no_data=no_data,
+            video_count=len(videos),
+        )
+
+    @app.route("/collect")
+    @login_required
+    @admin_required
+    def collect_page():
+        try:
+            collect_date = selected_date(request.args.get("date"))
+        except ValueError as exc:
+            return str(exc), 400
+
+        course_target = app.config["COURSE_DATASET_TARGET"]
+        try:
+            existing_count = len(unique_bvids(read_raw_from_hdfs(collect_date)))
+        except HdfsServiceError:
+            app.logger.exception(
+                "Collection progress HDFS read failed: date=%s", collect_date
+            )
+            existing_count = None
+            completion_percent = None
+            progress_width = 0
+        else:
+            completion_percent = existing_count / course_target * 100
+            progress_width = min(completion_percent, 100)
+
+        return render_template(
+            "collect.html",
+            selected_date=collect_date,
+            course_target=course_target,
+            existing_count=existing_count,
+            completion_percent=completion_percent,
+            progress_width=progress_width,
+        )
+
+    @app.get("/visualization")
+    @login_required
+    def visualization_page():
+        try:
+            collect_date = selected_date(request.args.get("date"))
+        except ValueError as exc:
+            return str(exc), 400
+
+        try:
+            analysis = run_spark_analysis(collect_date)
+        except Exception:
+            app.logger.exception("Spark analysis failed: date=%s", collect_date)
+            return render_template(
+                "visualization.html",
+                selected_date=collect_date,
+                analysis=None,
+                error="Spark 分析失败，请检查 Spark、Java 和 HDFS 环境",
+            )
+
+        return render_template(
+            "visualization.html",
+            selected_date=collect_date,
+            analysis=analysis,
+            error=None,
+        )
+
+    @app.route("/knowledge", methods=["GET", "POST"])
+    @login_required
+    def knowledge_page():
+        try:
+            date_value = (
+                request.form.get("date")
+                if request.method == "POST"
+                else request.args.get("date")
+            )
+            collect_date = selected_date(date_value)
+        except ValueError as exc:
+            return str(exc), 400
+
+        question = request.form.get("question", "")
+        if request.method == "POST" and not question.strip():
+            return "问题不能为空", 400
+
+        try:
+            videos = read_from_hdfs(collect_date)
+            if request.method == "POST":
+                answer = answer_question(videos, question.strip())
+            else:
+                build_retriever(videos)
+                answer = None
+        except Exception:
+            app.logger.exception("Knowledge base construction failed: date=%s", collect_date)
+            return render_template(
+                "knowledge.html",
+                selected_date=collect_date,
+                question=question,
+                answer=None,
+                error="知识库构建失败",
+            )
+
+        app.logger.info(
+            "Knowledge page loaded: date=%s, video_count=%s, has_question=%s",
+            collect_date,
+            len(videos),
+            bool(question.strip()),
+        )
+        return render_template(
+            "knowledge.html",
+            selected_date=collect_date,
+            question=question,
+            answer=answer,
+            error=None,
+        )
+
+    @app.post("/api/collect")
+    @login_required
+    @admin_required
+    def start_collection():
+        try:
+            keyword, target_count, collect_date = _parse_collect_request(
+                request.get_json(silent=True)
+            )
+        except ValueError as exc:
+            return {"message": str(exc)}, 400
+
+        task_id = create_task(keyword, target_count, collect_date)
+        app.logger.info(
+            "Collection task created: task_id=%s, keyword=%s, target_count=%s, collect_date=%s",
+            task_id,
+            keyword,
+            target_count,
+            collect_date,
+        )
+        threading.Thread(
+            target=run_collection_task,
+            args=(app, task_id, keyword, target_count, collect_date),
+            daemon=True,
+        ).start()
+        return {"task_id": task_id}, 202
+
+    @app.post("/api/clean")
+    @login_required
+    @admin_required
+    def clean_data():
+        payload = request.get_json(silent=True)
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("date"), str)
+            or not payload["date"]
+        ):
+            return {"message": "日期必须为 YYYY-MM-DD 格式"}, 400
+        try:
+            clean_date = selected_date(payload["date"])
+        except ValueError as exc:
+            return {"message": str(exc)}, 400
+
+        try:
+            raw_records = read_raw_from_hdfs(clean_date)
+            if not raw_records:
+                return {"message": "该日期暂无原始采集数据"}, 404
+
+            cleaned_records = clean_video_data(raw_records)
+            if not cleaned_records:
+                return {"message": "清洗后没有可保存的数据"}, 422
+
+            save_to_hdfs(cleaned_records, clean_date)
+        except Exception:
+            current_app.logger.exception("Manual cleaning failed: date=%s", clean_date)
+            return {
+                "message": "数据清洗失败，请查看服务日志并检查 HDFS 与数据格式"
+            }, 500
+        before_count = len(raw_records)
+        after_count = len(cleaned_records)
+        current_app.logger.info(
+            "Manual cleaning completed: date=%s, before_count=%s, after_count=%s",
+            clean_date,
+            before_count,
+            after_count,
+        )
+        return {
+            "before_count": before_count,
+            "after_count": after_count,
+            "removed_count": before_count - after_count,
+            "message": "数据清洗完成",
+        }
+
+    @app.get("/api/collect/status/<int:task_id>")
+    @login_required
+    def collection_status(task_id: int):
+        task = get_task(task_id)
+        if task is None:
+            return {"message": "采集任务不存在"}, 404
+
+        videos = []
+        note = ""
+        progress = _get_task_progress(task_id)
+        if task["status"] in {"success", "failed"} and progress["total_count"] is not None:
+            counts = progress
+            raw_records = None
+            if task["status"] == "success":
+                try:
+                    raw_records = read_raw_from_hdfs(_date_string(task["collect_date"]))
+                except HdfsServiceError:
+                    app.logger.exception(
+                        "Collection status HDFS read failed: task_id=%s, collect_date=%s",
+                        task_id,
+                        task["collect_date"],
+                    )
+        elif task["status"] in {"success", "failed"}:
+            added_count = task["success_count"]
+            try:
+                raw_records = read_raw_from_hdfs(_date_string(task["collect_date"]))
+            except HdfsServiceError:
+                app.logger.exception(
+                    "Collection status HDFS read failed: task_id=%s, collect_date=%s",
+                    task_id,
+                    task["collect_date"],
+                )
+                counts = {
+                    "existing_count": None,
+                    "added_count": added_count,
+                    "total_count": None,
+                }
+            else:
+                total_count = len(unique_bvids(raw_records))
+                counts = {
+                    "existing_count": None,
+                    "added_count": added_count,
+                    "total_count": total_count,
+                }
+        else:
+            counts = progress
+        if task["status"] == "success" and raw_records is not None:
+            videos = list(reversed(raw_records))[:10]
+            note = "该日期最新原始采集数据（最多10条）"
+        return {
+            **task,
+            **counts,
+            "course_target": app.config["COURSE_DATASET_TARGET"],
+            "latest_videos": videos,
+            "latest_videos_note": note,
+        }
+
+    @app.route("/logout")
     def logout():
         session.clear()
         return redirect(url_for("login"))
 
-    @app.get("/")
-    @login_required
-    def home():
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        cleaned_path = Path(app.config["CLEANED_DATA_PATH"])
-        video_data = load_cleaned_data(cleaned_path) if cleaned_path.exists() else load_video_data(raw_path)
-        play_count = video_data["play_count"].map(parse_number).sum() if "play_count" in video_data else 0
-        like_count = video_data["like_count"].map(parse_number).sum() if "like_count" in video_data else 0
-        up_count = video_data["up_name"].nunique() if "up_name" in video_data else 0
-        statistics = {
-            "video_total": len(video_data),
-            "up_total": int(up_count),
-            "play_total": int(play_count),
-            "like_total": int(like_count),
-        }
-        return render_template("home.html", statistics=statistics)
-
-    @app.route("/qa", methods=["GET", "POST"])
-    @login_required
-    def qa_page():
-        data, source = load_qa_data(Path(app.config["CLEANED_DATA_PATH"]), Path(app.config["VIDEO_DATA_PATH"]))
-        answer = answer_question(request.form.get("question", ""), data) if request.method == "POST" else None
-        return render_template("qa.html", data_count=len(data), source=source, answer=answer)
-
-    @app.route("/mining", methods=["GET", "POST"])
-    @login_required
-    def mining_page():
-        data, source = load_mining_data(Path(app.config["CLEANED_DATA_PATH"]), Path(app.config["VIDEO_DATA_PATH"]))
-        context = {"data_count": len(data), "source": source, "clusters": [], "points": [], "metrics": None, "rules": [], "prediction": None}
-        if len(data) < 10:
-            context["message"] = "当前数据量过少，请继续采集或导入更多数据后分析。"
-            return render_template("mining.html", **context)
-        if request.method == "POST":
-            action = request.form.get("action")
-            if action == "cluster":
-                context["clusters"], context["points"] = run_kmeans(data)
-            elif action == "rules":
-                context["rules"] = run_association_rules(data)
-            elif action == "predict":
-                try:
-                    values = {key: max(float(request.form.get(key, "")), 0) for key in MODEL_FEATURES}
-                except ValueError:
-                    flash("预测输入必须为大于等于0的数字。", "danger")
-                else:
-                    model, context["metrics"] = train_hot_model(data)
-                    context["prediction"] = predict_hot_video(model, values)
-        if context["metrics"] is None:
-            try:
-                _model, context["metrics"] = train_hot_model(data)
-            except ValueError:
-                context["message"] = "当前数据类别不足，暂时无法训练爆款预测模型。"
-        return render_template("mining.html", **context)
-
-    def get_spark_analysis() -> dict:
-        return run_spark_analysis(
-            Path(app.config["CLEANED_DATA_PATH"]),
-            Path(app.config["VIDEO_DATA_PATH"]),
-            app.config["HDFS_CMD"],
-        )
-
-    @app.get("/spark")
-    @login_required
-    def spark_page():
-        try:
-            analysis = get_spark_analysis()
-            spark_error = None
-        except SparkUnavailableError as error:
-            app.logger.warning("Spark 分析不可用：%s", error)
-            analysis = {
-                "source": "未启动",
-                "total_count": 0,
-                "up_video_count": [],
-                "top_played": [],
-                "up_avg_play": [],
-                "publish_trend": [],
-            }
-            spark_error = "Spark当前无法启动，请检查Java和PySpark环境。"
-        return render_template("spark.html", analysis=analysis, spark_error=spark_error)
-
-    @app.get("/api/spark/analysis")
-    @login_required
-    def spark_analysis_api():
-        try:
-            return jsonify(get_spark_analysis())
-        except SparkUnavailableError as error:
-            app.logger.warning("Spark 分析接口不可用：%s", error)
-            return jsonify({"error": "Spark当前无法启动，请检查Java和PySpark环境。"})
-
-    @app.route("/data", methods=["GET", "POST"])
-    @admin_required
-    def data_management():
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        cleaned_path = Path(app.config["CLEANED_DATA_PATH"])
-        summary_path = Path(app.config["CLEANING_SUMMARY_PATH"])
-        if request.method == "POST":
-            uploaded_file = request.files.get("file")
-            if uploaded_file is None or uploaded_file.filename == "":
-                flash("请选择需要导入的 CSV 文件。", "danger")
-                return redirect(url_for("data_management"))
-
-            safe_name = secure_filename(uploaded_file.filename)
-            if not safe_name or Path(uploaded_file.filename).suffix.lower() != ".csv":
-                flash("只支持上传 .csv 文件。", "danger")
-                return redirect(url_for("data_management"))
-
-            try:
-                uploaded_data = pd.read_csv(uploaded_file, dtype=object, encoding="utf-8-sig")
-            except (UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError):
-                flash("CSV 文件无法读取，请确认文件为 UTF-8 编码的有效 CSV。", "danger")
-                return redirect(url_for("data_management"))
-
-            normalized_data = normalize_columns(uploaded_data)
-            missing_columns = [column for column in REQUIRED_COLUMNS if column not in normalized_data]
-            if missing_columns:
-                flash(f"CSV缺少必要字段：{', '.join(missing_columns)}", "danger")
-                return redirect(url_for("data_management"))
-
-            imported_count = len(normalized_data)
-            total_count = append_video_data(normalized_data, raw_path)
-            flash(f"本次成功导入 {imported_count} 条视频数据，当前数据集共有 {total_count} 条数据。", "success")
-            return redirect(url_for("data_management"))
-
-        video_data = load_cleaned_data(cleaned_path) if cleaned_path.exists() else load_video_data(raw_path)
-        raw_total_count = len(load_video_data(raw_path))
-        hdfs_available, hdfs_message = check_hdfs_available(
-            app.config["HDFS_CMD"],
-            app.config["HDFS_WEB_URL"],
-            app.config["HDFS_WEB_USER"],
-        )
-        hdfs_file_exists = False
-        if hdfs_available:
-            hdfs_file_exists, _file_message = check_hdfs_file(
-                app.config["HDFS_CMD"],
-                app.config["HDFS_WEB_URL"],
-                app.config["HDFS_WEB_USER"],
-            )
-        recent_videos = video_data.tail(100).iloc[::-1].to_dict(orient="records")
-        return render_template(
-            "data.html",
-            total_count=len(video_data),
-            recent_videos=recent_videos,
-            data_source="清洗数据" if cleaned_path.exists() else "原始数据",
-            cleaning_summary=get_cleaning_summary(raw_path, cleaned_path, summary_path),
-            hdfs_available=hdfs_available,
-            hdfs_message=hdfs_message,
-            hdfs_file_exists=hdfs_file_exists,
-            hdfs_preview=session.pop("hdfs_preview", None),
-            crawl_result=session.pop("crawl_result", None),
-            browser_crawl_result=session.pop("browser_crawl_result", None),
-            browser_backfill_result=session.pop("browser_backfill_result", None),
-            raw_total_count=raw_total_count,
-            crawl_progress=min(raw_total_count / 10_000 * 100, 100),
-        )
-
-    @app.post("/data/browser-crawl")
-    @admin_required
-    def browser_crawl_data():
-        keyword = request.form.get("keyword", "").strip()
-        limit_text = request.form.get("limit", "").strip()
-        if not keyword:
-            flash("请输入采集关键词。", "danger")
-            return redirect(url_for("data_management"))
-
-        try:
-            limit = int(limit_text)
-        except ValueError:
-            flash("浏览器采集数量必须为1~200之间的整数。", "danger")
-            return redirect(url_for("data_management"))
-
-        if not 1 <= limit <= BROWSER_CRAWL_LIMIT:
-            flash("浏览器采集数量必须为1~200之间的整数。", "danger")
-            return redirect(url_for("data_management"))
-
-        if not browser_crawl_lock.acquire(blocking=False):
-            flash("浏览器采集任务正在运行，请等待当前任务完成。", "danger")
-            return redirect(url_for("data_management"))
-
-        result = None
-        interaction_result = None
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        try:
-            existing_urls = set(get_supported_video_urls(raw_path))
-            result = crawl_bilibili_browser(keyword, limit)
-            if int(result["saved_count"]) > 0:
-                current_urls = get_supported_video_urls(raw_path)
-                new_urls = [url for url in current_urls if url not in existing_urls]
-                if not new_urls:
-                    raise RuntimeError("browser crawl reported saved rows without new supported video URLs")
-                interaction_result = run_target_batches(
-                    new_urls,
-                    report=lambda batch: app.logger.info(
-                        "浏览器详情互动采集批次：batch=%s status=%s updated=%s remaining=%s",
-                        batch.get("batch"),
-                        batch.get("status"),
-                        batch.get("updated_count"),
-                        batch.get("remaining_count"),
-                    )
-                )
-        except Exception as error:
-            app.logger.exception("浏览器采集无法启动：%s", error)
-            if result is None:
-                flash("浏览器采集无法启动，请确认Microsoft Edge未被项目其他采集任务占用。", "danger")
-            else:
-                flash("搜索页数据已经保存，但详情互动数据采集失败，请查看应用日志。", "danger")
-            return redirect(url_for("data_management"))
-        finally:
-            browser_crawl_lock.release()
-
-        saved_count = int(result["saved_count"])
-        status = str(result["status"])
-        interaction_status = str(interaction_result["status"]) if interaction_result else "not_started"
-        interaction_updated_count = int(interaction_result["updated_count"]) if interaction_result else 0
-        interaction_remaining_count = int(interaction_result["remaining_count"]) if interaction_result else 0
-        summary_status = interaction_status if interaction_status in {"partial", "verification_required"} else status
-        session["browser_crawl_result"] = {
-            "keyword": keyword,
-            "planned_count": limit,
-            "saved_count": saved_count,
-            "parsed_count": int(result["parsed_count"]),
-            "skipped_count": int(result["skipped_count"]),
-            "page_count": int(result["page_count"]),
-            "total_count": len(load_video_data(raw_path)),
-            "interaction_updated_count": interaction_updated_count,
-            "interaction_remaining_count": interaction_remaining_count,
-            "interaction_status": interaction_status,
-            "status": {
-                "success": "正常完成",
-                "partial": "部分完成",
-                "no_results": "没有搜索结果",
-                "verification_required": "需要人工验证",
-                "page_structure_error": "页面结构异常",
-                "page_timeout": "页面加载超时",
-            }.get(summary_status, summary_status),
-        }
-
-        if interaction_status == "verification_required":
-            flash(
-                f"搜索页已新增 {saved_count} 条；详情互动数据采集需要人工验证，已完成 {interaction_updated_count} 条。",
-                "danger",
-            )
-        elif interaction_status == "partial":
-            flash(
-                f"搜索页已新增 {saved_count} 条；详情互动采集完成 {interaction_updated_count} 条，仍有 {interaction_remaining_count} 条未完成。",
-                "warning",
-            )
-        elif status == "success":
-            flash(
-                f"浏览器采集完成：成功新增 {saved_count} 条视频数据，并同步采集 {interaction_updated_count} 条详情互动数据。",
-                "success",
-            )
-        elif status == "verification_required":
-            flash("B站页面需要人工验证，本次已成功采集的数据已经保存，请完成验证后再继续。", "danger")
-        elif status == "page_structure_error":
-            flash("暂时无法识别B站搜索页面结构，请稍后检查页面。", "danger")
-        elif status == "no_results":
-            flash(f"B站搜索成功，但未找到与“{keyword}”相关的视频。", "danger")
-        elif status == "partial":
-            flash(f"计划采集{limit}条，本次成功新增{saved_count}条。", "warning")
-        else:
-            flash("浏览器页面加载超时，本次已成功采集的数据已经保存，请稍后再试。", "danger")
-        return redirect(url_for("data_management"))
-
-    @app.post("/data/browser-backfill")
-    @admin_required
-    def browser_backfill_data():
-        if not browser_crawl_lock.acquire(blocking=False):
-            flash("浏览器采集任务正在运行，请等待当前任务完成。", "danger")
-            return redirect(url_for("data_management"))
-
-        try:
-            result = backfill_bilibili_interactions(limit=50)
-        except Exception as error:
-            app.logger.exception("浏览器互动数据回填失败：%s", error)
-            flash("互动数据回填无法启动，请确认Microsoft Edge未被项目其他采集任务占用。", "danger")
-            return redirect(url_for("data_management"))
-        finally:
-            browser_crawl_lock.release()
-
-        status = str(result["status"])
-        updated_count = int(result["updated_count"])
-        raw_total_count = len(load_video_data(Path(app.config["VIDEO_DATA_PATH"])))
-        session["browser_backfill_result"] = {
-            "planned_count": int(result["planned_count"]),
-            "updated_count": updated_count,
-            "processed_count": int(result["processed_count"]),
-            "skipped_count": int(result["skipped_count"]),
-            "failed_count": int(result.get("failed_count", 0)),
-            "remaining_count": int(result.get("remaining_count", 0)),
-            "total_count": raw_total_count,
-            "status": {
-                "success": "正常完成",
-                "partial": "部分完成",
-                "verification_required": "需要人工验证",
-                "page_structure_error": "页面结构异常",
-                "page_timeout": "页面加载超时",
-            }.get(status, status),
-        }
-
-        if status == "success":
-            flash(f"互动数据回填完成：成功回填 {updated_count} 条视频数据。", "success")
-        elif status == "partial":
-            flash(
-                f"互动数据本批部分完成：成功回填{updated_count}条，跳过{int(result['skipped_count'])}条；失败链接已记录，后续批次会有限重试。",
-                "warning",
-            )
-        elif status == "verification_required":
-            flash("B站页面需要人工验证，已成功回填的数据已经保存，请完成验证后再继续。", "danger")
-        elif status == "page_structure_error":
-            flash("暂时无法识别B站视频详情页互动数据结构，请稍后检查页面。", "danger")
-        else:
-            flash("B站视频详情页加载超时，已成功回填的数据已经保存，请稍后再试。", "danger")
-        return redirect(url_for("data_management"))
-
-    @app.post("/data/crawl")
-    @admin_required
-    def crawl_data():
-        keyword = request.form.get("keyword", "").strip()
-        limit_text = request.form.get("limit", "").strip()
-        try:
-            limit = int(limit_text)
-        except ValueError:
-            flash("采集数量必须为1~1000之间的整数。", "danger")
-            return redirect(url_for("data_management"))
-
-        if not 1 <= limit <= 1000:
-            flash("采集数量必须为1~1000之间的整数。", "danger")
-            return redirect(url_for("data_management"))
-
-        try:
-            crawled_data = crawl_bilibili(keyword, limit)
-        except CrawlerError as error:
-            app.logger.warning("B站采集失败：%s", error)
-            flash(str(error), "danger")
-            return redirect(url_for("data_management"))
-
-        if crawled_data.empty:
-            flash(f"B站搜索成功，但未找到与“{keyword}”相关的视频。", "danger")
-            return redirect(url_for("data_management"))
-
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        total_count = append_video_data(normalize_columns(crawled_data), raw_path)
-        crawl_status = crawled_data.attrs.get("crawl_status", "completed")
-        crawl_message = crawled_data.attrs.get("crawl_message", "")
-        session["crawl_result"] = {
-            "keyword": keyword,
-            "planned_count": limit,
-            "success_count": len(crawled_data),
-            "total_count": total_count,
-            "page_count": crawled_data.attrs.get("page_count", 1),
-            "status": {
-                "completed": "正常完成",
-                "insufficient": "搜索结果不足",
-                "partial": "网络请求中断",
-                "limited": "B站暂时限制后续搜索请求",
-            }.get(crawl_status, "正常完成"),
-            "message": crawl_message,
-            "crawl_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-        flash(f"采集完成：成功采集 {len(crawled_data)} 条视频数据。", "success")
-        return redirect(url_for("data_management"))
-
-    @app.post("/data/clean")
-    @admin_required
-    def clean_data():
-        raw_path = Path(app.config["VIDEO_DATA_PATH"])
-        cleaned_path = Path(app.config["CLEANED_DATA_PATH"])
-        summary_path = Path(app.config["CLEANING_SUMMARY_PATH"])
-        if load_video_data(raw_path).empty:
-            flash("暂无可清洗的视频数据，请先使用 B 站采集。", "danger")
-            return redirect(url_for("data_management"))
-
-        summary = clean_video_data(raw_path, cleaned_path, summary_path)
-        flash(
-            f"数据清洗完成：原始 {summary['raw_count']} 条，清洗后 {summary['cleaned_count']} 条，删除重复 {summary['duplicate_count']} 条。",
-            "success",
-        )
-        return redirect(url_for("data_management"))
-
-    @app.post("/data/hdfs/upload")
-    @admin_required
-    def upload_hdfs_data():
-        success, message = upload_cleaned_to_hdfs(
-            Path(app.config["CLEANED_DATA_PATH"]),
-            app.config["HDFS_CMD"],
-            app.config["HDFS_WEB_URL"],
-            app.config["HDFS_WEB_USER"],
-        )
-        flash(message, "success" if success else "danger")
-        return redirect(url_for("data_management"))
-
-    @app.post("/data/hdfs/verify")
-    @admin_required
-    def verify_hdfs_data():
-        available, _message = check_hdfs_available(
-            app.config["HDFS_CMD"],
-            app.config["HDFS_WEB_URL"],
-            app.config["HDFS_WEB_USER"],
-        )
-        if not available:
-            flash("HDFS服务当前不可用，请检查Hadoop是否启动。", "danger")
-            return redirect(url_for("data_management"))
-
-        exists, _message = check_hdfs_file(
-            app.config["HDFS_CMD"],
-            app.config["HDFS_WEB_URL"],
-            app.config["HDFS_WEB_USER"],
-        )
-        if not exists:
-            flash("HDFS中暂未找到 videos_cleaned.csv", "danger")
-            return redirect(url_for("data_management"))
-
-        success, preview = read_hdfs_preview(
-            app.config["HDFS_CMD"],
-            hdfs_url=app.config["HDFS_WEB_URL"],
-            hdfs_user=app.config["HDFS_WEB_USER"],
-        )
-        if not success:
-            flash(f"HDFS读取失败：{preview}", "danger")
-            return redirect(url_for("data_management"))
-
-        session["hdfs_preview"] = preview
-        flash("HDFS文件存在，读取成功。", "success")
-        return redirect(url_for("data_management"))
-
-    @app.errorhandler(403)
-    def forbidden(_error):
-        return render_template("403.html"), 403
+    if app.config["ENABLE_SCHEDULER"]:
+        scheduler = build_scheduler(lambda: run_scheduled_collection(app))
+        scheduler.start()
+        app.extensions["course_scheduler"] = scheduler
 
     return app
 
 
 if __name__ == "__main__":
-    app = create_app()
-    app.run(port=app.config["PORT"])
+    create_app().run(host="127.0.0.1", port=5000, debug=False)

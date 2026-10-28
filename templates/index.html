@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+    <h1>大数据课程项目</h1>
+    <form method="get" action="{{ url_for('index') }}">
+        <label for="date">数据日期</label>
+        <input id="date" name="date" type="date" value="{{ selected_date }}">
+        <button type="submit">查询</button>
+    </form>
+</section>
+
+{% if error %}
+<section class="card">
+    <p class="alert danger">{{ error }}</p>
+</section>
+{% endif %}
+
+<section class="card">
+    <h2>{{ selected_date }} 数据概览</h2>
+    <p>视频数：{{ metrics.video_count }}</p>
+    <p>总播放：{{ metrics.total_views }}</p>
+    <p>总点赞：{{ metrics.total_likes }}</p>
+    <p>总投币：{{ metrics.total_coins }}</p>
+</section>
+
+<section class="card">
+    <h2>播放量 TOP5</h2>
+    {% if top_videos %}
+        <ol>
+            {% for video in top_videos %}
+                <li>
+                    <a href="{{ video.video_url }}" target="_blank" rel="noopener">{{ video.title }}</a>
+                    <span>{{ video.view_count }}</span>
+                </li>
+            {% endfor %}
+        </ol>
+    {% elif not error %}
+        <p>该日期暂无数据</p>
+    {% endif %}
+</section>
+
+<section class="card">
+    <a href="{{ url_for('data_page', date=selected_date) }}">查看数据查询</a>
+</section>
+{% endblock %}
